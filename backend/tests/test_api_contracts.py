@@ -10,9 +10,8 @@ from fastapi.testclient import TestClient
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
-TEST_DB_PATH = Path(tempfile.gettempdir()) / "pfg-backend-tests.sqlite3"
-os.environ["APP_STATE_DATABASE_URL"] = f"sqlite:///{TEST_DB_PATH.as_posix()}"
 
+import _test_env  # noqa: F401
 import main as backend_main
 
 
