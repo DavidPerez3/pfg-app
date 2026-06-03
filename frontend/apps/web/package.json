@@ -8,6 +8,7 @@
     "build": "turbo build:internal --filter=web",
     "build:internal": "next build",
     "start": "next start",
+    "test": "tsx --test src/lib/*.test.ts",
     "lint": "next lint",
     "lint:fix": "next lint --fix",
     "format": "prettier --write .",

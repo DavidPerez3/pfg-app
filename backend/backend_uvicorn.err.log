@@ -1,0 +1,5 @@
+INFO:     Started server process [19020]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+2026-05-29 16:24:20,250 | INFO | elastic_transport.transport | HEAD http://localhost:9200/pfg_user_memory [status:200 duration:0.016s]

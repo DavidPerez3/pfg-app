@@ -1,6 +1,8 @@
 fastapi
 uvicorn
 pydantic
+sqlalchemy
+psycopg[binary]
 langgraph
 langchain
 langchain-core
@@ -10,3 +12,6 @@ langgraph-checkpoint-sqlite
 requests
 openai
 instructor
+elasticsearch>=8,<9
+sentence-transformers
+numpy

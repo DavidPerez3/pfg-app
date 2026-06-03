@@ -31,6 +31,8 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
+from config import settings  # noqa: E402
+from hitl_utils import build_follow_up_prompts  # noqa: E402
 from shared.contracts import IntentClassification, RecommendRequest  # noqa: E402
 
 
@@ -41,18 +43,30 @@ class AgentState(TypedDict):
     intent: str
     attributes: dict[str, Any]
     trace_id: str
+    result: dict[str, Any]
 
 
-RECOMMENDER_BASE_URL = "http://localhost:8001"
+RECOMMENDER_BASE_URL = settings.recommender_base_url
+RECOMMENDER_API_V1_PREFIX = "/api/v1"
 
-# Maps UI model selector values to recommender endpoint paths.
-MODEL_ENDPOINT_MAP = {
-    "mf": "/mf",
-    "matrix_factorization": "/mf",
-    "two_tower": "/two_tower",
-    "two_tower_wide_deep": "/two_tower",
-    "sasrec": "/sasrec",
+# Maps UI model selector values to canonical recommender model slugs.
+MODEL_SLUG_MAP = {
+    "mf": "matrix-factorization",
+    "matrix_factorization": "matrix-factorization",
+    "two_tower": "two-tower",
+    "two_tower_wide_deep": "two-tower-wide-deep",
+    "sasrec": "sasrec",
+    "llm_rag": "llm-rag",
 }
+
+# Maps UI model selector values to recommender recommendation paths.
+MODEL_ENDPOINT_MAP = {
+    model_key: f"{RECOMMENDER_API_V1_PREFIX}/recommenders/{model_slug}/recommendations"
+    for model_key, model_slug in MODEL_SLUG_MAP.items()
+}
+
+SUPPORTED_DATASETS = {"movielens", "amazon_electronics", "yelp", "lastfm", "foursquare"}
+SUPPORTED_REC_MODELS = set(MODEL_ENDPOINT_MAP.keys())
 
 
 def _configurable(config: RunnableConfig | None) -> dict[str, Any]:
@@ -74,6 +88,110 @@ def _resolve_trace_id(state: AgentState | dict[str, Any], config: RunnableConfig
     if isinstance(thread_id, str) and thread_id.strip():
         return f"thread-{thread_id}"
     return f"trace-{uuid.uuid4().hex[:12]}"
+
+
+def _resolve_dataset(config: RunnableConfig | None) -> str:
+    cfg = _configurable(config)
+    dataset = cfg.get("dataset")
+    if isinstance(dataset, str) and dataset in SUPPORTED_DATASETS:
+        return dataset
+    return settings.default_dataset
+
+
+def _resolve_rec_model(config: RunnableConfig | None) -> str:
+    cfg = _configurable(config)
+    rec_model = cfg.get("rec_model")
+    if isinstance(rec_model, str) and rec_model in SUPPORTED_REC_MODELS:
+        return rec_model
+    return settings.default_rec_model
+
+
+def _resolve_user_id(config: RunnableConfig | None) -> str:
+    cfg = _configurable(config)
+    user_id = cfg.get("user_id")
+    if isinstance(user_id, str) and user_id.strip():
+        return user_id.strip()
+    return "anonymous"
+
+
+def _resolve_dataset_user_id(config: RunnableConfig | None) -> str | None:
+    cfg = _configurable(config)
+    dataset_user_id = cfg.get("dataset_user_id")
+    if isinstance(dataset_user_id, str) and dataset_user_id.strip():
+        return dataset_user_id.strip()
+    return None
+
+
+def _resolve_hitl_refinement_active(config: RunnableConfig | None) -> bool:
+    cfg = _configurable(config)
+    return bool(cfg.get("hitl_refinement_active"))
+
+
+def _resolve_hitl_refinement_context(config: RunnableConfig | None) -> str | None:
+    cfg = _configurable(config)
+    value = cfg.get("hitl_refinement_context")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _classify_intent_fast_path(user_text: str) -> tuple[str, dict[str, Any]] | None:
+    normalized = " ".join(user_text.lower().strip().split())
+    if not normalized:
+        return None
+
+    recommendation_markers = (
+        "recommend",
+        "suggest",
+        "what should i watch",
+        "what should i listen",
+        "what should i buy",
+    )
+    similarity_markers = ("similar to", "like ", "items like", "more like")
+    lookup_markers = ("find ", "search ", "look up", "show me", "who is", "what is")
+    preference_statement_prefixes = (
+        "i like ",
+        "i love ",
+        "i prefer ",
+        "i enjoy ",
+        "my favorite",
+        "my favourite",
+        "i don't like ",
+        "i do not like ",
+        "i hate ",
+    )
+
+    if any(marker in normalized for marker in recommendation_markers):
+        return (
+            "user_recommendation",
+            {"item_query": "", "needs_weather_tool": False, "reason": "heuristic_recommendation"},
+        )
+
+    if normalized.startswith(preference_statement_prefixes):
+        return (
+            "general_qa",
+            {"item_query": "", "needs_weather_tool": False, "reason": "heuristic_preference_statement"},
+        )
+
+    if any(marker in normalized for marker in similarity_markers):
+        item_query = user_text.strip()
+        for marker in ("similar to", "like ", "items like", "more like"):
+            if marker in normalized:
+                start = normalized.find(marker) + len(marker)
+                item_query = user_text[start:].strip(" .?!\"'")
+                break
+        return (
+            "item_similarity",
+            {"item_query": item_query, "needs_weather_tool": False, "reason": "heuristic_similarity"},
+        )
+
+    if any(marker in normalized for marker in lookup_markers):
+        return (
+            "entity_lookup",
+            {"item_query": user_text.strip(), "needs_weather_tool": False, "reason": "heuristic_lookup"},
+        )
+
+    return None
 
 
 def _kv(**kwargs: object) -> str:
@@ -247,6 +365,35 @@ def classifier_node(state: AgentState, config: RunnableConfig) -> dict:
     user_text = _content_to_text(messages[-1].content)
 
     with _timed_span(trace_id, "backend.classifier", preview=user_text[:80]):
+        if _resolve_hitl_refinement_active(config):
+            attributes = {
+                "item_query": "",
+                "needs_weather_tool": False,
+                "reason": "thread_refinement",
+            }
+            log.info(
+                "[CLASSIFIER] trace_id=%r via=hitl_refinement intent=%r attributes=%s",
+                trace_id,
+                "user_recommendation",
+                attributes,
+            )
+            return {
+                "trace_id": trace_id,
+                "intent": "user_recommendation",
+                "attributes": attributes,
+            }
+
+        heuristic = _classify_intent_fast_path(user_text)
+        if heuristic is not None:
+            intent, attributes = heuristic
+            log.info(
+                "[CLASSIFIER] trace_id=%r via=heuristic intent=%r attributes=%s",
+                trace_id,
+                intent,
+                attributes,
+            )
+            return {"trace_id": trace_id, "intent": intent, "attributes": attributes}
+
         try:
             parsed = _classify_intent_with_instructor(user_text)
             intent = parsed.intent
@@ -314,35 +461,54 @@ def user_recommendation_node(state: AgentState, config: RunnableConfig) -> dict:
     import requests as http_requests
 
     trace_id = _resolve_trace_id(state, config)
-    cfg = _configurable(config)
-    dataset = cfg.get("dataset", "movielens")
-    rec_model = cfg.get("rec_model", "matrix_factorization")
-    user_id = cfg.get("user_id", "anonymous")
+    dataset = _resolve_dataset(config)
+    rec_model = _resolve_rec_model(config)
+    user_id = _resolve_user_id(config)
+    dataset_user_id = _resolve_dataset_user_id(config)
+    refinement_context = _resolve_hitl_refinement_context(config)
     last_prompt = _content_to_text(state["messages"][-1].content) if state.get("messages") else ""
+    effective_prompt = (
+        f"{refinement_context}\n\nCurrent refinement request:\n{last_prompt}"
+        if refinement_context
+        else last_prompt
+    )
 
-    with _timed_span(trace_id, "backend.user_recommendation", dataset=dataset, model=rec_model, user_id=user_id):
+    with _timed_span(
+        trace_id,
+        "backend.user_recommendation",
+        dataset=dataset,
+        model=rec_model,
+        user_id=user_id,
+        dataset_user_id=dataset_user_id,
+    ):
         try:
-            endpoint = MODEL_ENDPOINT_MAP.get(rec_model, "/mf")
+            endpoint = MODEL_ENDPOINT_MAP.get(
+                rec_model,
+                f"{RECOMMENDER_API_V1_PREFIX}/recommenders/matrix-factorization/recommendations",
+            )
             url = f"{RECOMMENDER_BASE_URL}{endpoint}"
             request_payload = RecommendRequest(
                 user_id=str(user_id),
                 dataset=str(dataset),
-                prompt=last_prompt,
+                prompt=effective_prompt,
                 top_k=10,
                 trace_id=trace_id,
                 origin_intent="user_recommendation",
+                dataset_user_id=dataset_user_id,
             )
             payload_dict = request_payload.model_dump()
             log.info("[USER_RECOMMENDATION] trace_id=%r POST %s payload=%s", trace_id, url, payload_dict)
 
             remote_start = time.perf_counter()
-            resp = http_requests.post(url, json=payload_dict, timeout=20)
+            recommendation_timeout = 90 if rec_model == "llm_rag" else 45
+            resp = http_requests.post(url, json=payload_dict, timeout=recommendation_timeout)
             remote_ms = round((time.perf_counter() - remote_start) * 1000, 2)
             resp.raise_for_status()
 
             data = resp.json()
             items = data.get("items", [])
             cold_start = data.get("cold_start", False)
+            explanation = data.get("explanation")
             preview = [str(item.get("title", "")) for item in items[:5]]
             log.info(
                 "[USER_RECOMMENDATION] trace_id=%r status=%s remote_ms=%s cold_start=%s n_items=%s preview_titles=%s",
@@ -357,21 +523,38 @@ def user_recommendation_node(state: AgentState, config: RunnableConfig) -> dict:
             if not items:
                 return {"trace_id": trace_id, "messages": [AIMessage(content="No recommendations found for this profile yet.")]}
 
-            items_list = "\n".join(
-                f"{i + 1}. {item['title']}" + (f" ({item['genres']})" if item.get("genres") else "")
-                for i, item in enumerate(items)
-            )
             cold_start_note = (
-                "\n\nNote: these are global/popularity recommendations to avoid mapping your external identity "
-                "to real dataset users."
+                " Cold-start mode."
                 if cold_start
                 else ""
             )
             content = (
-                f"Here are your recommendations for `{dataset}` using `{rec_model}`:\n\n"
-                f"{items_list}{cold_start_note}"
+                explanation
+                or (
+                    f"I found {len(items)} recommendations in `{dataset}` using `{data.get('model', rec_model)}`."
+                    f"{cold_start_note} Review the ranked cards below."
+                )
             )
-            return {"trace_id": trace_id, "messages": [AIMessage(content=content)]}
+            return {
+                "trace_id": trace_id,
+                "result": {
+                    "kind": "recommendations",
+                    "title": "Recommendations",
+                    "subtitle": f"Dataset: {dataset} | Model: {data.get('model', rec_model)}",
+                    "items": items,
+                    "dataset": dataset,
+                    "rec_model": data.get("model", rec_model),
+                    "dataset_user_id": dataset_user_id,
+                    "cold_start": cold_start,
+                    "trace_id": trace_id,
+                    "explanation": explanation,
+                    "follow_up_prompts": build_follow_up_prompts(
+                        items=items,
+                        cold_start=bool(cold_start),
+                    ),
+                },
+                "messages": [AIMessage(content=content)],
+            }
 
         except http_requests.exceptions.ConnectionError:
             text = (
@@ -380,16 +563,29 @@ def user_recommendation_node(state: AgentState, config: RunnableConfig) -> dict:
                 f"-> Dataset: {dataset} | Model: {rec_model} | User: {user_id}"
             )
             return {"trace_id": trace_id, "messages": [AIMessage(content=text)]}
+        except http_requests.exceptions.HTTPError as exc:
+            detail = ""
+            if exc.response is not None:
+                try:
+                    payload = exc.response.json()
+                    detail = str(payload.get("detail", "")).strip()
+                except Exception:
+                    detail = exc.response.text.strip()
+
+            if exc.response is not None and exc.response.status_code == 404 and detail:
+                return {"trace_id": trace_id, "messages": [AIMessage(content=detail)]}
+
+            message = detail or str(exc)
+            return {"trace_id": trace_id, "messages": [AIMessage(content=f"Recommendation error: {message}")]}
         except Exception as exc:
             return {"trace_id": trace_id, "messages": [AIMessage(content=f"Recommendation error: {exc}")]}
 
 def entity_lookup_node(state: AgentState, config: RunnableConfig) -> dict:
-    """Search items/entities by name through /search endpoint."""
+    """Search items/entities through the versioned dataset-item search endpoint."""
     import requests as http_requests
 
     trace_id = _resolve_trace_id(state, config)
-    cfg = _configurable(config)
-    dataset = cfg.get("dataset", "movielens")
+    dataset = _resolve_dataset(config)
     last_prompt = _content_to_text(state["messages"][-1].content) if state.get("messages") else ""
     attrs = state.get("attributes", {})
 
@@ -405,18 +601,18 @@ def entity_lookup_node(state: AgentState, config: RunnableConfig) -> dict:
 
     with _timed_span(trace_id, "backend.entity_lookup", dataset=dataset, query=extracted_query):
         try:
-            request_payload = {
-                "query": extracted_query,
-                "dataset": dataset,
-                "top_k": 10,
+            request_params = {
+                "q": extracted_query,
+                "limit": 10,
                 "trace_id": trace_id,
             }
-            log.info("[ENTITY_LOOKUP] trace_id=%r POST %s/search payload=%s", trace_id, RECOMMENDER_BASE_URL, request_payload)
+            target_url = f"{RECOMMENDER_BASE_URL}{RECOMMENDER_API_V1_PREFIX}/datasets/{dataset}/items/search"
+            log.info("[ENTITY_LOOKUP] trace_id=%r GET %s params=%s", trace_id, target_url, request_params)
             remote_start = time.perf_counter()
-            resp = http_requests.post(
-                f"{RECOMMENDER_BASE_URL}/search",
-                json=request_payload,
-                timeout=20,
+            resp = http_requests.get(
+                target_url,
+                params=request_params,
+                timeout=45,
             )
             remote_ms = round((time.perf_counter() - remote_start) * 1000, 2)
             resp.raise_for_status()
@@ -447,8 +643,24 @@ def entity_lookup_node(state: AgentState, config: RunnableConfig) -> dict:
                 f"{i + 1}. {item['title']}" + (f" ({item['genres']})" if item.get("genres") else "")
                 for i, item in enumerate(results)
             )
-            content = f"Search results for '{extracted_query}' in `{dataset}`:\n\n{items_list}"
-            return {"trace_id": trace_id, "messages": [AIMessage(content=content)]}
+            content = (
+                f"I found {len(results)} matching items for '{extracted_query}' in `{dataset}`. "
+                "The best matches are shown below as cards.\n\n"
+                f"Quick list:\n{items_list}"
+            )
+            return {
+                "trace_id": trace_id,
+                "result": {
+                    "kind": "search_results",
+                    "title": f"Search results for {extracted_query}",
+                    "subtitle": f"Dataset: {dataset}",
+                    "items": results,
+                    "dataset": dataset,
+                    "query": extracted_query,
+                    "trace_id": trace_id,
+                },
+                "messages": [AIMessage(content=content)],
+            }
 
         except http_requests.exceptions.ConnectionError:
             return {
@@ -465,9 +677,8 @@ def item_similarity_node(state: AgentState, config: RunnableConfig) -> dict:
     import requests as http_requests
 
     trace_id = _resolve_trace_id(state, config)
-    cfg = _configurable(config)
-    dataset = cfg.get("dataset", "movielens")
-    rec_model = cfg.get("rec_model", "matrix_factorization")
+    dataset = _resolve_dataset(config)
+    rec_model = _resolve_rec_model(config)
     last_prompt = _content_to_text(state["messages"][-1].content) if state.get("messages") else ""
     attrs = state.get("attributes", {})
 
@@ -482,13 +693,13 @@ def item_similarity_node(state: AgentState, config: RunnableConfig) -> dict:
         )
 
     similar_endpoint_map = {
-        "mf": "/mf/similar",
-        "matrix_factorization": "/mf/similar",
-        "two_tower": "/mf/similar",
-        "two_tower_wide_deep": "/mf/similar",
-        "sasrec": "/mf/similar",
+        model_key: f"{RECOMMENDER_API_V1_PREFIX}/recommenders/{model_slug}/similar-items"
+        for model_key, model_slug in MODEL_SLUG_MAP.items()
     }
-    endpoint = similar_endpoint_map.get(rec_model, "/mf/similar")
+    endpoint = similar_endpoint_map.get(
+        rec_model,
+        f"{RECOMMENDER_API_V1_PREFIX}/recommenders/matrix-factorization/similar-items",
+    )
 
     with _timed_span(
         trace_id,
@@ -510,7 +721,7 @@ def item_similarity_node(state: AgentState, config: RunnableConfig) -> dict:
             resp = http_requests.post(
                 f"{RECOMMENDER_BASE_URL}{endpoint}",
                 json=request_payload,
-                timeout=20,
+                timeout=45,
             )
             remote_ms = round((time.perf_counter() - remote_start) * 1000, 2)
             resp.raise_for_status()
@@ -532,12 +743,24 @@ def item_similarity_node(state: AgentState, config: RunnableConfig) -> dict:
             if not items:
                 return {"trace_id": trace_id, "messages": [AIMessage(content=f"No similar items found for '{seed_title}'.")]}
 
-            items_list = "\n".join(
-                f"{i + 1}. {item['title']}" + (f" ({item['genres']})" if item.get("genres") else "")
-                for i, item in enumerate(items)
+            content = (
+                f"I found {len(items)} items similar to '{seed_title}' in `{dataset}` using `{data.get('model', rec_model)}`. "
+                "The ranked list is rendered below."
             )
-            content = f"Items similar to '{seed_title}' in `{dataset}` ({rec_model}):\n\n{items_list}"
-            return {"trace_id": trace_id, "messages": [AIMessage(content=content)]}
+            return {
+                "trace_id": trace_id,
+                "result": {
+                    "kind": "similar_items",
+                    "title": f"Because you searched for {seed_title}",
+                    "subtitle": f"Dataset: {dataset} | Model: {data.get('model', rec_model)}",
+                    "items": items,
+                    "dataset": dataset,
+                    "rec_model": data.get("model", rec_model),
+                    "seed_title": seed_title,
+                    "trace_id": trace_id,
+                },
+                "messages": [AIMessage(content=content)],
+            }
 
         except http_requests.exceptions.ConnectionError:
             return {
@@ -547,6 +770,17 @@ def item_similarity_node(state: AgentState, config: RunnableConfig) -> dict:
                 ],
             }
         except http_requests.exceptions.HTTPError as exc:
+            detail = ""
+            if exc.response is not None:
+                try:
+                    payload = exc.response.json()
+                    detail = str(payload.get("detail", "")).strip()
+                except Exception:
+                    detail = exc.response.text.strip()
+
+            if exc.response is not None and exc.response.status_code == 404 and detail.lower().startswith("run not trained"):
+                return {"trace_id": trace_id, "messages": [AIMessage(content=detail)]}
+
             if exc.response is not None and exc.response.status_code == 404:
                 return {
                     "trace_id": trace_id,

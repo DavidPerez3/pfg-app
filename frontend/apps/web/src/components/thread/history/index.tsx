@@ -1,10 +1,4 @@
 import { Button } from "@/components/ui/button";
-import { useThreads } from "@/providers/Thread";
-import { Thread } from "@langchain/langgraph-sdk";
-import { useEffect } from "react";
-
-import { getContentString } from "../utils";
-import { useQueryState, parseAsBoolean } from "nuqs";
 import {
   Sheet,
   SheetContent,
@@ -12,59 +6,65 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
-import { PanelRightOpen, PanelRightClose } from "lucide-react";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
+import { getBackendBaseUrl } from "@/lib/backend-base-url";
+import { AppThread } from "@/lib/chat-types";
+import { useThreads } from "@/providers/Thread";
+import { PanelRightClose, PanelRightOpen, Trash2 } from "lucide-react";
+import { useEffect } from "react";
+import { parseAsBoolean, useQueryState } from "nuqs";
+import { toast } from "sonner";
 
 function ThreadList({
   threads,
   onThreadClick,
+  onThreadDelete,
 }: {
-  threads: Thread[];
+  threads: AppThread[];
   onThreadClick?: (threadId: string) => void;
+  onThreadDelete?: (threadId: string) => void;
 }) {
   const [threadId, setThreadId] = useQueryState("threadId");
 
   return (
     <div className="h-full flex flex-col w-full gap-2 items-start justify-start overflow-y-scroll [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-gray-300 [&::-webkit-scrollbar-track]:bg-transparent">
-      {threads.map((t) => {
-        const metadataTitle =
-          typeof (t as any)?.metadata?.title === "string"
-            ? (t as any).metadata.title.trim()
-            : "";
-
-        let itemText = t.thread_id;
-
-        if (metadataTitle) {
-          itemText = metadataTitle;
-        } else if (
-          typeof t.values === "object" &&
-          t.values &&
-          "messages" in t.values &&
-          Array.isArray(t.values.messages) &&
-          t.values.messages?.length > 0
-        ) {
-          const firstMessage =
-            t.values.messages.find((m) => (m as any)?.type === "human") ??
-            t.values.messages[0];
-          itemText = getContentString(firstMessage.content);
-        }
-        return (
-          <div key={t.thread_id} className="w-full px-1">
+      {threads.map((thread) => (
+        <div key={thread.thread_id} className="w-full px-1">
+          <div className="flex w-full items-start gap-2">
             <Button
               variant="ghost"
-              className="text-left items-start justify-start font-normal w-[280px]"
+              className="text-left items-start justify-start font-normal w-[236px]"
               onClick={(e) => {
                 e.preventDefault();
-                onThreadClick?.(t.thread_id);
-                if (t.thread_id === threadId) return;
-                setThreadId(t.thread_id);
+                onThreadClick?.(thread.thread_id);
+                if (thread.thread_id === threadId) return;
+                setThreadId(thread.thread_id);
               }}
             >
-              <p className="truncate text-ellipsis">{itemText}</p>
+              <div className="flex w-full flex-col items-start">
+                <p className="truncate text-ellipsis">{thread.title}</p>
+                <span className="text-xs text-slate-500">
+                  {new Date(thread.updated_at).toLocaleString()}
+                </span>
+              </div>
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="shrink-0 text-slate-500 hover:bg-rose-50 hover:text-rose-700"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onThreadDelete?.(thread.thread_id);
+              }}
+              aria-label={`Delete thread ${thread.title}`}
+              title="Delete thread"
+            >
+              <Trash2 className="size-4" />
             </Button>
           </div>
-        );
-      })}
+        </div>
+      ))}
     </div>
   );
 }
@@ -72,7 +72,7 @@ function ThreadList({
 function ThreadHistoryLoading() {
   return (
     <div className="h-full flex flex-col w-full gap-2 items-start justify-start overflow-y-scroll [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-gray-300 [&::-webkit-scrollbar-track]:bg-transparent">
-      {Array.from({ length: 30 }).map((_, i) => (
+      {Array.from({ length: 12 }).map((_, i) => (
         <Skeleton key={`skeleton-${i}`} className="w-[280px] h-10" />
       ))}
     </div>
@@ -80,34 +80,62 @@ function ThreadHistoryLoading() {
 }
 
 export default function ThreadHistory() {
+  const backendBaseUrl = getBackendBaseUrl();
   const isLargeScreen = useMediaQuery("(min-width: 1024px)");
   const [chatHistoryOpen, setChatHistoryOpen] = useQueryState(
     "chatHistoryOpen",
     parseAsBoolean.withDefault(false),
   );
+  const [, setThreadId] = useQueryState("threadId");
 
-  const { getThreads, threads, setThreads, threadsLoading, setThreadsLoading } =
-    useThreads();
+  const {
+    deleteThread,
+    getThreads,
+    threads,
+    setThreads,
+    threadsLoading,
+    setThreadsLoading,
+  } = useThreads();
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
     let cancelled = false;
-
     setThreadsLoading(true);
     getThreads()
       .then((fetched) => {
         if (cancelled) return;
         setThreads(fetched);
       })
-      .catch(console.error)
       .finally(() => {
         if (!cancelled) setThreadsLoading(false);
       });
-
     return () => {
       cancelled = true;
     };
   }, [getThreads, setThreads, setThreadsLoading]);
+
+  const handleDeleteThread = async (threadId: string) => {
+    try {
+      const response = await fetch(`${backendBaseUrl}/api/v1/threads/${threadId}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+    } catch (error) {
+      const detail =
+        error instanceof Error ? error.message : "Unexpected thread delete error";
+      toast.error("Backend thread delete failed", {
+        description:
+          "The local thread will still be removed from the UI history. " +
+          `Backend detail: ${detail}`,
+        richColors: true,
+        closeButton: true,
+      });
+    } finally {
+      deleteThread(threadId);
+      setThreadId((current) => (current === threadId ? null : current));
+    }
+  };
 
   return (
     <>
@@ -131,7 +159,7 @@ export default function ThreadHistory() {
         {threadsLoading ? (
           <ThreadHistoryLoading />
         ) : (
-          <ThreadList threads={threads} />
+          <ThreadList threads={threads} onThreadDelete={handleDeleteThread} />
         )}
       </div>
       <div className="lg:hidden">
@@ -149,6 +177,7 @@ export default function ThreadHistory() {
             <ThreadList
               threads={threads}
               onThreadClick={() => setChatHistoryOpen((o) => !o)}
+              onThreadDelete={handleDeleteThread}
             />
           </SheetContent>
         </Sheet>

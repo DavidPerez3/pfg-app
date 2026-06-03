@@ -1,115 +1,130 @@
-import { validate } from "uuid";
-import { getApiKey } from "@/lib/api-key";
-import { Thread } from "@langchain/langgraph-sdk";
-import { useQueryState } from "nuqs";
+import { AppThread } from "@/lib/chat-types";
 import { useSession } from "next-auth/react";
 import {
   createContext,
-  useContext,
-  ReactNode,
   useCallback,
+  useContext,
   useEffect,
+  useMemo,
   useState,
-  Dispatch,
-  SetStateAction,
+  type Dispatch,
+  type ReactNode,
+  type SetStateAction,
 } from "react";
-import { createClient } from "./client";
 
 interface ThreadContextType {
-  getThreads: () => Promise<Thread[]>;
-  threads: Thread[];
-  setThreads: Dispatch<SetStateAction<Thread[]>>;
+  getThreads: () => Promise<AppThread[]>;
+  getThreadById: (threadId: string | null) => AppThread | undefined;
+  saveThread: (thread: AppThread) => void;
+  deleteThread: (threadId: string) => void;
+  threads: AppThread[];
+  setThreads: Dispatch<SetStateAction<AppThread[]>>;
   threadsLoading: boolean;
   setThreadsLoading: Dispatch<SetStateAction<boolean>>;
 }
 
 const ThreadContext = createContext<ThreadContextType | undefined>(undefined);
 
-function getThreadSearchMetadata(
-  assistantId: string,
-): { graph_id: string } | { assistant_id: string } {
-  if (validate(assistantId)) {
-    return { assistant_id: assistantId };
-  } else {
-    return { graph_id: assistantId };
-  }
+function sortThreads(threads: AppThread[]): AppThread[] {
+  return [...threads].sort((a, b) => {
+    return (
+      new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+    );
+  });
 }
 
-function getUserAliases(stableUserKey: string): string[] {
-  if (typeof window === "undefined" || !stableUserKey) return [];
+function safeParseThreads(raw: string | null): AppThread[] {
+  if (!raw) return [];
   try {
-    const raw = window.localStorage.getItem(`lg:user_aliases:${stableUserKey}`);
-    const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string") : [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (thread): thread is AppThread =>
+        typeof thread?.thread_id === "string" &&
+        typeof thread?.title === "string" &&
+        typeof thread?.updated_at === "string" &&
+        Array.isArray(thread?.messages),
+    );
   } catch {
     return [];
   }
 }
 
-function saveUserAlias(stableUserKey: string, alias: string) {
-  if (typeof window === "undefined" || !stableUserKey || !alias) return;
-  const current = new Set(getUserAliases(stableUserKey));
-  current.add(alias);
-  window.localStorage.setItem(
-    `lg:user_aliases:${stableUserKey}`,
-    JSON.stringify(Array.from(current)),
-  );
-}
-
 export function ThreadProvider({ children }: { children: ReactNode }) {
   const { data: session } = useSession();
-  const envApiUrl: string | undefined = process.env.NEXT_PUBLIC_API_URL;
-  const envAssistantId: string | undefined =
-    process.env.NEXT_PUBLIC_ASSISTANT_ID;
-  const [apiUrl] = useQueryState("apiUrl");
-  const [assistantId] = useQueryState("assistantId");
-  const finalApiUrl = apiUrl || envApiUrl;
-  const finalAssistantId = assistantId || envAssistantId;
   const userId = session?.user?.id ?? "anonymous";
   const userEmail = (session?.user?.email ?? "").trim().toLowerCase();
   const stableUserKey = userEmail || userId;
-  const [threads, setThreads] = useState<Thread[]>([]);
+  const storageKey = useMemo(
+    () => `pfg:threads:${stableUserKey}`,
+    [stableUserKey],
+  );
+
+  const [threads, setThreads] = useState<AppThread[]>([]);
   const [threadsLoading, setThreadsLoading] = useState(false);
 
+  const getThreads = useCallback(async (): Promise<AppThread[]> => {
+    if (typeof window === "undefined") return [];
+    const parsed = safeParseThreads(window.localStorage.getItem(storageKey));
+    return sortThreads(parsed);
+  }, [storageKey]);
+
   useEffect(() => {
-    saveUserAlias(stableUserKey, userId);
-  }, [stableUserKey, userId]);
+    if (typeof window === "undefined") return;
+    setThreadsLoading(true);
+    getThreads()
+      .then((loaded) => setThreads(loaded))
+      .finally(() => setThreadsLoading(false));
+  }, [getThreads]);
 
-  const getThreads = useCallback(async (): Promise<Thread[]> => {
-    if (!finalApiUrl || !finalAssistantId) return [];
-    const client = createClient(finalApiUrl, getApiKey() ?? undefined);
+  const persistThreads = useCallback(
+    (nextThreadsOrUpdater: AppThread[] | ((current: AppThread[]) => AppThread[])) => {
+      const resolvedThreads =
+        typeof nextThreadsOrUpdater === "function"
+          ? nextThreadsOrUpdater(threads)
+          : nextThreadsOrUpdater;
+      const sortedThreads = sortThreads(resolvedThreads);
+      setThreads(sortedThreads);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(storageKey, JSON.stringify(sortedThreads));
+      }
+    },
+    [storageKey, threads],
+  );
 
-    const allThreads = await client.threads.search({
-      metadata: {
-        ...getThreadSearchMetadata(finalAssistantId),
-      },
-      limit: 100,
-    });
+  const getThreadById = useCallback(
+    (threadId: string | null) =>
+      threads.find((thread) => thread.thread_id === threadId),
+    [threads],
+  );
 
-    const aliases = new Set(getUserAliases(stableUserKey));
-    aliases.add(userId);
+  const saveThread = useCallback(
+    (thread: AppThread) => {
+      persistThreads((currentThreads) => {
+        const nextThreads = currentThreads.filter(
+          (existingThread) => existingThread.thread_id !== thread.thread_id,
+        );
+        nextThreads.push(thread);
+        return nextThreads;
+      });
+    },
+    [persistThreads],
+  );
 
-    const filtered = allThreads.filter((t: any) => {
-      const ownerEmail =
-        typeof t?.metadata?.user_email === "string"
-          ? t.metadata.user_email.trim().toLowerCase()
-          : "";
-      const ownerKey =
-        typeof t?.metadata?.user_key === "string" ? t.metadata.user_key : "";
-      const ownerId =
-        typeof t?.metadata?.user_id === "string" ? t.metadata.user_id : "";
-
-      if (ownerEmail) return ownerEmail === userEmail;
-      if (ownerKey) return ownerKey === stableUserKey;
-      if (ownerId) return aliases.has(ownerId);
-      return false;
-    });
-
-    return filtered;
-  }, [finalApiUrl, finalAssistantId, stableUserKey, userEmail, userId]);
+  const deleteThread = useCallback(
+    (threadId: string) => {
+      persistThreads((currentThreads) =>
+        currentThreads.filter((thread) => thread.thread_id !== threadId),
+      );
+    },
+    [persistThreads],
+  );
 
   const value = {
     getThreads,
+    getThreadById,
+    saveThread,
+    deleteThread,
     threads,
     setThreads,
     threadsLoading,
@@ -123,7 +138,7 @@ export function ThreadProvider({ children }: { children: ReactNode }) {
 
 export function useThreads() {
   const context = useContext(ThreadContext);
-  if (context === undefined) {
+  if (!context) {
     throw new Error("useThreads must be used within a ThreadProvider");
   }
   return context;

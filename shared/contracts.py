@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 
 IntentName = Literal["user_recommendation", "entity_lookup", "item_similarity", "general_qa"]
+ResultKind = Literal["recommendations", "search_results", "similar_items"]
 
 
 class IntentAttributes(BaseModel):
@@ -25,6 +26,46 @@ class RecommendedItem(BaseModel):
     genres: str = ""
 
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessage]
+    thread_id: str | None = None
+    user_id: str | None = None
+    trace_id: str | None = None
+    dataset: str | None = None
+    rec_model: str | None = None
+    dataset_user_id: str | None = None
+
+
+class ChatResult(BaseModel):
+    kind: ResultKind
+    title: str
+    subtitle: str = ""
+    items: list[RecommendedItem] = Field(default_factory=list)
+    dataset: str | None = None
+    rec_model: str | None = None
+    dataset_user_id: str | None = None
+    cold_start: bool | None = None
+    query: str | None = None
+    seed_title: str | None = None
+    trace_id: str | None = None
+    explanation: str | None = None
+    follow_up_prompts: list[str] = Field(default_factory=list)
+
+
+class ChatResponse(BaseModel):
+    messages: list[ChatMessage]
+    trace_id: str | None = None
+    intent: IntentName | None = None
+    dataset: str | None = None
+    rec_model: str | None = None
+    result: ChatResult | None = None
+
+
 class RecommendRequest(BaseModel):
     user_id: str
     dataset: str = "movielens"
@@ -32,6 +73,7 @@ class RecommendRequest(BaseModel):
     top_k: int = 10
     trace_id: str | None = None
     origin_intent: IntentName | None = None
+    dataset_user_id: str | None = None
 
 
 class RecommendResponse(BaseModel):
@@ -41,6 +83,7 @@ class RecommendResponse(BaseModel):
     cold_start: bool
     items: list[RecommendedItem]
     trace_id: str | None = None
+    explanation: str | None = None
 
 
 class SearchRequest(BaseModel):
@@ -71,3 +114,58 @@ class SimilarResponse(BaseModel):
     items: list[RecommendedItem]
     trace_id: str | None = None
 
+
+class FeedbackRequest(BaseModel):
+    user_id: str
+    thread_id: str
+    rating: int = Field(..., ge=1, le=5)
+    comment: str = ""
+    message_index: int | None = None
+    trace_id: str | None = None
+
+
+class FeedbackResponse(BaseModel):
+    status: str
+    feedback_id: str
+
+
+class FeedbackSummary(BaseModel):
+    count: int
+    average_rating: float | None = None
+    distribution: dict[str, int] = Field(default_factory=dict)
+
+
+class MemoryFact(BaseModel):
+    fact: str
+    source: str = "app"
+    created_at: str
+
+
+class MemoryResponse(BaseModel):
+    user_id: str
+    facts: list[MemoryFact] = Field(default_factory=list)
+    count: int = 0
+
+
+class SessionMemoryMessage(BaseModel):
+    role: str
+    content: str
+    created_at: str
+
+
+class ShortTermMemoryResponse(BaseModel):
+    thread_id: str
+    messages: list[SessionMemoryMessage] = Field(default_factory=list)
+    count: int = 0
+    window_hours: int = 24
+
+
+class DatasetUserOption(BaseModel):
+    user_id: str
+    interaction_count: int
+
+
+class DatasetUsersResponse(BaseModel):
+    dataset: str
+    users: list[DatasetUserOption] = Field(default_factory=list)
+    total_available: int = 0

@@ -3,3 +3,7 @@ uvicorn
 numpy
 pandas
 pyarrow
+torch
+elasticsearch>=8,<9
+sentence-transformers
+requests

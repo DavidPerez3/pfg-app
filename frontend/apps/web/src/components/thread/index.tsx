@@ -1,42 +1,62 @@
-import { v4 as uuidv4 } from "uuid";
-import { ReactNode, useEffect, useRef } from "react";
-import { motion } from "framer-motion";
-import { cn } from "@/lib/utils";
-import { useStreamContext } from "@/providers/Stream";
-import { useState, FormEvent } from "react";
-import { Button } from "../ui/button";
-import { Checkpoint, Message } from "@langchain/langgraph-sdk";
-import { AssistantMessage, AssistantMessageLoading } from "./messages/ai";
-import { HumanMessage } from "./messages/human";
+"use client";
+
 import {
-  DO_NOT_RENDER_ID_PREFIX,
-  ensureToolCallsHaveResponses,
-} from "@/lib/ensure-tool-responses";
-import { LangGraphLogoSVG } from "../icons/langgraph";
-import { TooltipIconButton } from "./tooltip-icon-button";
+  DatasetUserOption,
+  AppMessage,
+  AppRecModel,
+  AppThread,
+} from "@/lib/chat-types";
+import { cn } from "@/lib/utils";
+import {
+  attachResultToLatestAssistant,
+  makeThreadTitle,
+  mergeBackendMessages,
+} from "@/lib/thread-helpers";
+import { getBackendBaseUrl } from "@/lib/backend-base-url";
+import { useThreads } from "@/providers/Thread";
+import { useSession, signOut } from "next-auth/react";
+import { parseAsBoolean, useQueryState } from "nuqs";
+import React, { FormEvent, ReactNode, useMemo, useRef, useState } from "react";
+import { v4 as uuidv4 } from "uuid";
+import { motion } from "framer-motion";
+import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 import {
   ArrowDown,
   LoaderCircle,
-  PanelRightOpen,
-  PanelRightClose,
-  SquarePen,
   LogOut,
+  PanelRightClose,
+  PanelRightOpen,
+  SquarePen,
 } from "lucide-react";
-import { useQueryState, parseAsBoolean } from "nuqs";
-import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
+
+import { AssistantMessage, AssistantMessageLoading } from "./messages/ai";
+import { HumanMessage } from "./messages/human";
 import ThreadHistory from "./history";
-import { toast } from "sonner";
+import { LangGraphLogoSVG } from "../icons/langgraph";
+import { TooltipIconButton } from "./tooltip-icon-button";
+import { Button } from "../ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../ui/tooltip";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
-import { Label } from "../ui/label";
-import { Switch } from "../ui/switch";
-import { GitHubSVG } from "../icons/github";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "../ui/tooltip";
-import { useSession, signOut } from "next-auth/react";
+import { toast } from "sonner";
+
+type FeedbackState = "idle" | "submitting" | "submitted";
+const REC_MODEL_STORAGE_KEY = "pfg:selected-rec-model";
+const DATASET_STORAGE_KEY = "pfg:selected-dataset";
+const DATASET_USERS_STORAGE_KEY = "pfg:selected-dataset-users";
+const REC_MODEL_OPTIONS: Array<{ value: AppRecModel; label: string }> = [
+  { value: "mf", label: "Matrix Factorization" },
+  { value: "two_tower", label: "Two-Tower" },
+  { value: "two_tower_wide_deep", label: "Two-Tower + Wide&Deep" },
+  { value: "sasrec", label: "SASRec" },
+  { value: "llm_rag", label: "LLM + RAG" },
+];
+const DATASET_OPTIONS = [
+  { value: "movielens", label: "MovieLens" },
+  { value: "lastfm", label: "LastFM" },
+  { value: "yelp", label: "Yelp" },
+  { value: "amazon_electronics", label: "Amazon Electronics" },
+  { value: "foursquare", label: "Foursquare" },
+] as const;
 
 function StickyToBottomContent(props: {
   content: ReactNode;
@@ -76,187 +96,383 @@ function ScrollToBottom(props: { className?: string }) {
   );
 }
 
-function OpenGitHubRepo() {
-  return (
-    <TooltipProvider>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <a
-            href="https://github.com/langchain-ai/agent-chat-ui"
-            target="_blank"
-            className="flex items-center justify-center"
-          >
-            <GitHubSVG width="24" height="24" />
-          </a>
-        </TooltipTrigger>
-        <TooltipContent side="left">
-          <p>Open GitHub repo</p>
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
-  );
-}
-
 export function Thread() {
+  const backendBaseUrl = getBackendBaseUrl();
   const [threadId, setThreadId] = useQueryState("threadId");
   const [chatHistoryOpen, setChatHistoryOpen] = useQueryState(
     "chatHistoryOpen",
     parseAsBoolean.withDefault(false),
   );
-  const [hideToolCalls, setHideToolCalls] = useQueryState(
-    "hideToolCalls",
-    parseAsBoolean.withDefault(false),
-  );
-  const [dataset, setDataset] = useQueryState("dataset", { defaultValue: "movielens" });
-  const [recModel, setRecModel] = useQueryState("rec_model", { defaultValue: "mf" });
 
   const { data: session } = useSession();
-
-  const [input, setInput] = useState("");
-  const [firstTokenReceived, setFirstTokenReceived] = useState(false);
+  const { threads, saveThread } = useThreads();
   const isLargeScreen = useMediaQuery("(min-width: 1024px)");
 
-  const stream = useStreamContext();
-  const messages = stream.messages;
-  const isLoading = stream.isLoading;
-  const inFlightTrace = useRef<{ traceId: string; startedAtMs: number } | null>(
-    null,
+  const currentThread = useMemo(
+    () => threads.find((thread) => thread.thread_id === threadId),
+    [threadId, threads],
   );
+  const messages = currentThread?.messages ?? [];
+  const chatStarted = messages.length > 0;
 
-  const lastError = useRef<string | undefined>(undefined);
+  const [input, setInput] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [selectedRecModel, setSelectedRecModel] = useState<AppRecModel>("mf");
+  const [selectedDataset, setSelectedDataset] = useState("movielens");
+  const [datasetUsers, setDatasetUsers] = useState<DatasetUserOption[]>([]);
+  const [datasetUsersLoading, setDatasetUsersLoading] = useState(false);
+  const [selectedDatasetUsersByDataset, setSelectedDatasetUsersByDataset] =
+    useState<Record<string, string>>({});
+  const [feedbackByMessage, setFeedbackByMessage] = useState<
+    Record<string, FeedbackState>
+  >({});
+  const abortRef = useRef<AbortController | null>(null);
+  const hasStoredDatasetPreference = useRef(false);
 
-  useEffect(() => {
-    if (!stream.error) {
-      lastError.current = undefined;
-      return;
+  const selectedDatasetUserId =
+    selectedDatasetUsersByDataset[selectedDataset] ?? "";
+
+  const stableUserId =
+    session?.user?.email?.trim().toLowerCase() ??
+    session?.user?.id ??
+    "anonymous";
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    const savedModel = window.localStorage.getItem(REC_MODEL_STORAGE_KEY);
+    const isKnownModel = REC_MODEL_OPTIONS.some(
+      (option) => option.value === savedModel,
+    );
+    if (isKnownModel) {
+      setSelectedRecModel(savedModel as AppRecModel);
     }
+  }, [backendBaseUrl]);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(REC_MODEL_STORAGE_KEY, selectedRecModel);
+  }, [selectedRecModel]);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    const savedDataset = window.localStorage.getItem(DATASET_STORAGE_KEY);
+    const isKnownDataset = DATASET_OPTIONS.some(
+      (option) => option.value === savedDataset,
+    );
+    if (savedDataset && isKnownDataset) {
+      setSelectedDataset(savedDataset);
+      hasStoredDatasetPreference.current = true;
+    }
+
+    const savedDatasetUsers = window.localStorage.getItem(
+      DATASET_USERS_STORAGE_KEY,
+    );
+    if (!savedDatasetUsers) return;
+
     try {
-      const message = (stream.error as any).message;
-      if (!message || lastError.current === message) {
-        // Message has already been logged. do not modify ref, return early.
+      const parsed = JSON.parse(savedDatasetUsers) as Record<string, string>;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        setSelectedDatasetUsersByDataset(parsed);
+      }
+    } catch {
+      // Ignore malformed local storage values and keep defaults.
+    }
+  }, []);
+
+  React.useEffect(() => {
+    let cancelled = false;
+
+    const loadBackendDefaults = async () => {
+      try {
+        const response = await fetch(`${backendBaseUrl}/`);
+        if (!response.ok) return;
+        const payload = await response.json();
+        const nextDataset = payload?.defaults?.dataset;
+        if (!cancelled && typeof nextDataset === "string" && nextDataset.trim()) {
+          if (!hasStoredDatasetPreference.current) {
+            setSelectedDataset(nextDataset);
+          }
+        }
+      } catch {
+        // Keep the local default when backend metadata is unavailable.
+      }
+    };
+
+    void loadBackendDefaults();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(DATASET_STORAGE_KEY, selectedDataset);
+  }, [backendBaseUrl, selectedDataset]);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(
+      DATASET_USERS_STORAGE_KEY,
+      JSON.stringify(selectedDatasetUsersByDataset),
+    );
+  }, [selectedDatasetUsersByDataset]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+
+    const loadDatasetUsers = async () => {
+      setDatasetUsersLoading(true);
+      try {
+        const params = new URLSearchParams({
+          limit: "25",
+        });
+        const response = await fetch(
+          `${backendBaseUrl}/api/v1/datasets/${selectedDataset}/users?${params.toString()}`,
+        );
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        if (cancelled) return;
+        const users: DatasetUserOption[] = Array.isArray(payload?.users)
+          ? payload.users
+          : [];
+        setDatasetUsers(users);
+      } catch {
+        if (!cancelled) {
+          setDatasetUsers([]);
+          toast.error("Dataset users could not be loaded", {
+            description:
+              "The selector fell back to cold start because the frontend could not fetch the dataset-user list.",
+            richColors: true,
+            closeButton: true,
+          });
+        }
+      } finally {
+        if (!cancelled) {
+          setDatasetUsersLoading(false);
+        }
+      }
+    };
+
+    void loadDatasetUsers();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedDataset]);
+
+  React.useEffect(() => {
+    if (!selectedDatasetUserId) return;
+    const exists = datasetUsers.some(
+      (user) => String(user.user_id) === String(selectedDatasetUserId),
+    );
+    if (!exists) {
+      setSelectedDatasetUsersByDataset((prev) => {
+        const next = { ...prev };
+        delete next[selectedDataset];
+        return next;
+      });
+    }
+  }, [datasetUsers, selectedDataset, selectedDatasetUserId]);
+
+  const sendPrompt = async (rawPrompt: string) => {
+    if (!rawPrompt.trim() || isLoading) return;
+
+    const resolvedThreadId = currentThread?.thread_id ?? uuidv4();
+    const now = new Date().toISOString();
+    const traceId = uuidv4();
+    const userMessage: AppMessage = {
+      id: uuidv4(),
+      role: "user",
+      content: rawPrompt.trim(),
+      createdAt: now,
+      traceId,
+    };
+
+    const optimisticMessages = [...messages, userMessage];
+    const optimisticThread: AppThread = {
+      thread_id: resolvedThreadId,
+      title: currentThread?.title || makeThreadTitle(userMessage.content),
+      updated_at: now,
+      messages: optimisticMessages,
+    };
+
+    if (!threadId) {
+      setThreadId(resolvedThreadId);
+    }
+    saveThread(optimisticThread);
+    setInput("");
+    setIsLoading(true);
+
+    abortRef.current = new AbortController();
+
+    try {
+      const response = await fetch(
+        `${backendBaseUrl}/api/v1/threads/${resolvedThreadId}/messages`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          signal: abortRef.current.signal,
+          body: JSON.stringify({
+            messages: optimisticMessages.map((message) => ({
+              role: message.role,
+              content: message.content,
+            })),
+            thread_id: resolvedThreadId,
+            user_id: stableUserId,
+            trace_id: traceId,
+            dataset: selectedDataset,
+            rec_model: selectedRecModel,
+            dataset_user_id: selectedDatasetUserId || null,
+          }),
+        },
+      );
+
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(detail || `HTTP ${response.status}`);
+      }
+
+      const payload = await response.json();
+      const nextMessages = attachResultToLatestAssistant(
+        mergeBackendMessages(
+          optimisticMessages,
+          payload.messages ?? [],
+          payload.trace_id,
+        ),
+        payload.result,
+      );
+
+      saveThread({
+        thread_id: resolvedThreadId,
+        title: optimisticThread.title,
+        updated_at: new Date().toISOString(),
+        messages: nextMessages.length > 0 ? nextMessages : optimisticMessages,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
         return;
       }
 
-      // Message is defined, and it has not been logged yet. Save it, and send the error
-      lastError.current = message;
-      toast.error("An error occurred. Please try again.", {
-        description: (
-          <p>
-            <strong>Error:</strong> <code>{message}</code>
-          </p>
-        ),
+      const detail =
+        error instanceof Error ? error.message : "Unexpected chat error";
+      const errorMessage: AppMessage = {
+        id: uuidv4(),
+        role: "assistant",
+        content:
+          "The backend request failed. Please check that the public FastAPI backend is running on `http://localhost:8000`.\n\n" +
+          `Error: ${detail}`,
+        createdAt: new Date().toISOString(),
+        traceId,
+      };
+
+      saveThread({
+        thread_id: resolvedThreadId,
+        title: optimisticThread.title,
+        updated_at: new Date().toISOString(),
+        messages: [...optimisticMessages, errorMessage],
+      });
+      toast.error("Chat request failed", {
+        description: detail,
         richColors: true,
         closeButton: true,
       });
-    } catch {
-      // no-op
+    } finally {
+      setIsLoading(false);
+      abortRef.current = null;
     }
-  }, [stream.error]);
+  };
 
-  // TODO: this should be part of the useStream hook
-  const prevMessageLength = useRef(0);
-  useEffect(() => {
-    if (
-      messages.length !== prevMessageLength.current &&
-      messages?.length &&
-      messages[messages.length - 1].type === "ai"
-    ) {
-      setFirstTokenReceived(true);
-    }
-
-    prevMessageLength.current = messages.length;
-  }, [messages]);
-
-  useEffect(() => {
-    if (!isLoading && inFlightTrace.current) {
-      const elapsedMs = performance.now() - inFlightTrace.current.startedAtMs;
-      console.info("[frontend][response_complete]", {
-        trace_id: inFlightTrace.current.traceId,
-        elapsed_ms: Number(elapsedMs.toFixed(2)),
-        total_messages: messages.length,
-      });
-      inFlightTrace.current = null;
-    }
-  }, [isLoading, messages.length]);
-
-  const handleSubmit = (e: FormEvent) => {
+  const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || isLoading) return;
-    setFirstTokenReceived(false);
-
-    const newHumanMessage: Message = {
-      id: uuidv4(),
-      type: "human",
-      content: input,
-    };
-
-    const toolMessages = ensureToolCallsHaveResponses(stream.messages);
-    const stableUserId =
-      session?.user?.email?.trim().toLowerCase() ??
-      session?.user?.id ??
-      "anonymous";
-    const traceId = uuidv4();
-    inFlightTrace.current = {
-      traceId,
-      startedAtMs: performance.now(),
-    };
-    console.info("[frontend][submit]", {
-      trace_id: traceId,
-      dataset,
-      rec_model: recModel,
-      user_id: stableUserId,
-      thread_id: threadId ?? null,
-      input_preview: input.slice(0, 120),
-    });
-    stream.submit(
-      { messages: [...toolMessages, newHumanMessage] },
-      {
-        streamMode: ["values"],
-        config: {
-          configurable: {
-            dataset,
-            rec_model: recModel,
-            user_id: stableUserId,
-            trace_id: traceId,
-          }
-        },
-        optimisticValues: (prev) => ({
-          ...prev,
-          messages: [
-            ...(prev.messages ?? []),
-            ...toolMessages,
-            newHumanMessage,
-          ],
-        }),
-      },
-    );
-
-    setInput("");
+    await sendPrompt(input);
   };
 
-  const handleRegenerate = (
-    parentCheckpoint: Checkpoint | null | undefined,
+  const handleFollowUpPrompt = async (prompt: string) => {
+    await sendPrompt(prompt);
+  };
+
+  const handleCancel = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setIsLoading(false);
+  };
+
+  const handleFeedback = async (
+    message: AppMessage,
+    rating: number,
+    messageIndex: number,
   ) => {
-    // Do this so the loading state is correct
-    prevMessageLength.current = prevMessageLength.current - 1;
-    setFirstTokenReceived(false);
-    stream.submit(undefined, {
-      checkpoint: parentCheckpoint,
-      streamMode: ["values"],
-    });
-  };
+    if (!currentThread?.thread_id) return;
 
-  const chatStarted = !!threadId || !!messages.length;
-  const hasNoAIOrToolMessages = !messages.find(
-    (m) => m.type === "ai" || m.type === "tool",
-  );
+    setFeedbackByMessage((prev) => ({
+      ...prev,
+      [message.id]: "submitting",
+    }));
+
+    try {
+      const response = await fetch(
+        `${backendBaseUrl}/api/v1/threads/${currentThread.thread_id}/feedback`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            user_id: stableUserId,
+            thread_id: currentThread.thread_id,
+            rating,
+            comment:
+              rating >= 4
+                ? "Marked as useful from the chat UI."
+                : "Marked as needing work from the chat UI.",
+            message_index: messageIndex,
+            trace_id: message.traceId,
+          }),
+        },
+      );
+
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(detail || `HTTP ${response.status}`);
+      }
+
+      setFeedbackByMessage((prev) => ({
+        ...prev,
+        [message.id]: "submitted",
+      }));
+      toast.success("Feedback stored", {
+        description: "The backend recorded your rating for this answer.",
+        richColors: true,
+        closeButton: true,
+      });
+    } catch (error) {
+      const detail =
+        error instanceof Error ? error.message : "Unexpected feedback error";
+      setFeedbackByMessage((prev) => ({
+        ...prev,
+        [message.id]: "idle",
+      }));
+      toast.error("Feedback request failed", {
+        description: detail,
+        richColors: true,
+        closeButton: true,
+      });
+    }
+  };
 
   return (
-    <div className="flex w-full h-screen overflow-hidden">
-      <div className="relative lg:flex hidden">
+    <div className="flex h-screen overflow-hidden bg-background">
+      <div
+        className={cn(
+          "relative transition-all",
+          chatHistoryOpen ? "w-[300px]" : "w-0",
+        )}
+      >
         <motion.div
-          className="absolute h-full border-r bg-white overflow-hidden z-20"
-          style={{ width: 300 }}
+          className="h-full"
           animate={
             isLargeScreen
               ? { x: chatHistoryOpen ? 0 : -300 }
@@ -274,11 +490,9 @@ export function Thread() {
           </div>
         </motion.div>
       </div>
+
       <motion.div
-        className={cn(
-          "flex-1 flex flex-col min-w-0 overflow-hidden relative",
-          !chatStarted && "grid-rows-[1fr]",
-        )}
+        className="flex-1 flex flex-col min-w-0 overflow-hidden relative"
         layout={isLargeScreen}
         animate={{
           marginLeft: chatHistoryOpen ? (isLargeScreen ? 300 : 0) : 0,
@@ -312,7 +526,6 @@ export function Thread() {
               )}
             </div>
             <div className="absolute top-2 right-4 flex items-center gap-3">
-              <OpenGitHubRepo />
               {session?.user && (
                 <TooltipProvider>
                   <Tooltip>
@@ -337,7 +550,7 @@ export function Thread() {
                       </button>
                     </TooltipTrigger>
                     <TooltipContent side="bottom">
-                      <p>Cerrar sesión ({session.user.name})</p>
+                      <p>Sign out ({session.user.name})</p>
                     </TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
@@ -345,6 +558,7 @@ export function Thread() {
             </div>
           </div>
         )}
+
         {chatStarted && (
           <div className="flex items-center justify-between gap-3 p-2 z-10 relative">
             <div className="flex items-center justify-start gap-2 relative">
@@ -377,41 +591,24 @@ export function Thread() {
               >
                 <LangGraphLogoSVG width={32} height={32} />
                 <span className="text-xl font-semibold tracking-tight">
-                  Recommender Chatbot
+                  PFG Recommender System
                 </span>
               </motion.button>
-
-              {/* Desktop Model/Dataset Selectors */}
-              <div className="hidden lg:flex ml-4 gap-2">
-                <select
-                  className="px-3 py-1 text-sm border bg-white rounded-md shadow-sm outline-none cursor-pointer text-gray-700"
-                  value={dataset || "movielens"}
-                  onChange={(e) => setDataset(e.target.value)}
-                >
-                  <option value="movielens">🎥 MovieLens</option>
-                  <option value="amazon_electronics">🛒 Amazon</option>
-                  <option value="yelp">🍔 Yelp</option>
-                  <option value="lastfm">🎵 LastFM</option>
-                  <option value="foursquare">📍 Foursquare</option>
-                </select>
-                <select
-                  className="px-3 py-1 text-sm border bg-white rounded-md shadow-sm outline-none cursor-pointer text-gray-700"
-                  value={recModel || "mf"}
-                  onChange={(e) => setRecModel(e.target.value)}
-                >
-                  <option value="mf">Matrix Factorization</option>
-                  <option value="two_tower">Two-Tower</option>
-                  <option value="sasrec">SASRec</option>
-                  <option value="llm_rag">LLM + RAG</option>
-                </select>
-              </div>
-
             </div>
 
             <div className="flex items-center gap-4">
-              <div className="flex items-center">
-                <OpenGitHubRepo />
-              </div>
+              <a
+                href="/arch"
+                className="hidden rounded-full border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 shadow-sm transition hover:bg-gray-50 lg:inline-flex"
+              >
+                Architecture
+              </a>
+              <a
+                href="/api-reference"
+                className="hidden rounded-full border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 shadow-sm transition hover:bg-gray-50 lg:inline-flex"
+              >
+                API
+              </a>
               <TooltipIconButton
                 size="lg"
                 className="p-4"
@@ -421,8 +618,6 @@ export function Thread() {
               >
                 <SquarePen className="size-5" />
               </TooltipIconButton>
-
-              {/* User avatar + logout */}
               {session?.user && (
                 <TooltipProvider>
                   <Tooltip>
@@ -447,7 +642,7 @@ export function Thread() {
                       </button>
                     </TooltipTrigger>
                     <TooltipContent side="bottom">
-                      <p>Cerrar sesión ({session.user.name})</p>
+                      <p>Sign out ({session.user.name})</p>
                     </TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
@@ -465,40 +660,37 @@ export function Thread() {
               !chatStarted && "flex flex-col items-stretch mt-[25vh]",
               chatStarted && "grid grid-rows-[1fr_auto]",
             )}
-            contentClassName="pt-8 pb-16  max-w-3xl mx-auto flex flex-col gap-4 w-full"
+            contentClassName="pt-8 pb-16 max-w-3xl mx-auto flex flex-col gap-4 w-full"
             content={
               <>
-                {messages
-                  .filter((m) => !m.id?.startsWith(DO_NOT_RENDER_ID_PREFIX))
-                  .map((message, index) =>
-                    message.type === "human" ? (
-                      <HumanMessage
-                        key={message.id || `${message.type}-${index}`}
-                        message={message}
-                        isLoading={isLoading}
-                      />
-                    ) : (
-                      <AssistantMessage
-                        key={message.id || `${message.type}-${index}`}
-                        message={message}
-                        isLoading={isLoading}
-                        handleRegenerate={handleRegenerate}
-                      />
-                    ),
-                  )}
-                {/* Special rendering case where there are no AI/tool messages, but there is an interrupt.
-                    We need to render it outside of the messages list, since there are no messages to render */}
-                {hasNoAIOrToolMessages && !!stream.interrupt && (
-                  <AssistantMessage
-                    key="interrupt-msg"
-                    message={undefined}
-                    isLoading={isLoading}
-                    handleRegenerate={handleRegenerate}
-                  />
+                {messages.map((message) =>
+                  message.role === "user" ? (
+                    <HumanMessage
+                      key={message.id}
+                      message={message}
+                      isLoading={isLoading}
+                    />
+                  ) : (
+                    <AssistantMessage
+                      key={message.id}
+                      message={message}
+                      isLoading={isLoading}
+                      onFollowUpPrompt={handleFollowUpPrompt}
+                      feedbackState={feedbackByMessage[message.id] ?? "idle"}
+                      onFeedback={(rating) =>
+                        handleFeedback(
+                          message,
+                          rating,
+                          messages.findIndex(
+                            (currentMessage) =>
+                              currentMessage.id === message.id,
+                          ),
+                        )
+                      }
+                    />
+                  ),
                 )}
-                {isLoading && !firstTokenReceived && (
-                  <AssistantMessageLoading />
-                )}
+                {isLoading && <AssistantMessageLoading />}
               </>
             }
             footer={
@@ -511,31 +703,11 @@ export function Thread() {
                         PFG Recommender System
                       </h1>
                     </div>
-
-                    {/* Selectors for Home screen */}
-                    <div className="flex flex-wrap items-center justify-center gap-3">
-                      <select
-                        className="px-4 py-2 text-sm border bg-white rounded-md shadow-sm outline-none cursor-pointer text-gray-700"
-                        value={dataset || "movielens"}
-                        onChange={(e) => setDataset(e.target.value)}
-                      >
-                        <option value="movielens">🎥 MovieLens</option>
-                        <option value="amazon_electronics">🛒 Amazon</option>
-                        <option value="yelp">🍔 Yelp</option>
-                        <option value="lastfm">🎵 LastFM</option>
-                        <option value="foursquare">📍 Foursquare</option>
-                      </select>
-                      <select
-                        className="px-4 py-2 text-sm border bg-white rounded-md shadow-sm outline-none cursor-pointer text-gray-700"
-                        value={recModel || "mf"}
-                        onChange={(e) => setRecModel(e.target.value)}
-                      >
-                        <option value="mf">Matrix Factorization</option>
-                        <option value="two_tower">Two-Tower</option>
-                        <option value="sasrec">SASRec</option>
-                        <option value="llm_rag">LLM + RAG</option>
-                      </select>
-                    </div>
+                    <p className="max-w-xl text-center text-sm text-gray-600">
+                      This chat now talks directly to the public FastAPI backend.
+                      Ask naturally for recommendations, similar items, or
+                      general questions.
+                    </p>
                   </div>
                 )}
 
@@ -566,36 +738,98 @@ export function Thread() {
                       className="p-3.5 pb-0 border-none bg-transparent field-sizing-content shadow-none ring-0 outline-none focus:outline-none focus:ring-0 resize-none"
                     />
 
-                    <div className="flex items-center justify-between p-2 pt-4">
-                      <div>
-                        <div className="flex items-center space-x-2">
-                          <Switch
-                            id="render-tool-calls"
-                            checked={hideToolCalls ?? false}
-                            onCheckedChange={setHideToolCalls}
-                          />
-                          <Label
-                            htmlFor="render-tool-calls"
-                            className="text-sm text-gray-600"
+                    <div className="flex flex-col gap-3 p-3 pt-2">
+                      <div className="flex flex-wrap items-end gap-3">
+                        <label className="flex min-w-[210px] flex-col gap-1 text-xs text-gray-600">
+                          <span className="pl-1 font-medium uppercase tracking-[0.14em] text-gray-500">
+                            Paradigm
+                          </span>
+                          <select
+                            value={selectedRecModel}
+                            onChange={(event) =>
+                              setSelectedRecModel(
+                                event.target.value as AppRecModel,
+                              )
+                            }
+                            className="rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-sm outline-none transition focus:border-slate-400"
                           >
-                            Hide Tool Calls
-                          </Label>
-                        </div>
+                            {REC_MODEL_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="flex min-w-[160px] flex-col gap-1 text-xs text-gray-600">
+                          <span className="pl-1 font-medium uppercase tracking-[0.14em] text-gray-500">
+                            Dataset
+                          </span>
+                          <select
+                            value={selectedDataset}
+                            onChange={(event) =>
+                              setSelectedDataset(event.target.value)
+                            }
+                            className="rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-sm outline-none transition focus:border-slate-400"
+                          >
+                            {DATASET_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="flex min-w-[230px] flex-1 flex-col gap-1 text-xs text-gray-600">
+                          <span className="pl-1 font-medium uppercase tracking-[0.14em] text-gray-500">
+                            Dataset user
+                          </span>
+                          <select
+                            value={selectedDatasetUserId}
+                            onChange={(event) =>
+                              setSelectedDatasetUsersByDataset((prev) => {
+                                const next = { ...prev };
+                                if (event.target.value) {
+                                  next[selectedDataset] = event.target.value;
+                                } else {
+                                  delete next[selectedDataset];
+                                }
+                                return next;
+                              })
+                            }
+                            className="rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-sm outline-none transition focus:border-slate-400"
+                            disabled={datasetUsersLoading}
+                          >
+                            <option value="">
+                              {datasetUsersLoading
+                                ? "Loading profiles..."
+                                : "Cold start"}
+                            </option>
+                            {datasetUsers.map((user) => (
+                              <option key={user.user_id} value={user.user_id}>
+                                {user.user_id} · {user.interaction_count} ints
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        {isLoading ? (
+                          <Button
+                            key="stop"
+                            onClick={handleCancel}
+                            type="button"
+                            className="self-end"
+                          >
+                            <LoaderCircle className="w-4 h-4 animate-spin" />
+                            Cancel
+                          </Button>
+                        ) : (
+                          <Button
+                            type="submit"
+                            className="self-end transition-all shadow-md"
+                            disabled={!input.trim()}
+                          >
+                            Send
+                          </Button>
+                        )}
                       </div>
-                      {stream.isLoading ? (
-                        <Button key="stop" onClick={() => stream.stop()}>
-                          <LoaderCircle className="w-4 h-4 animate-spin" />
-                          Cancel
-                        </Button>
-                      ) : (
-                        <Button
-                          type="submit"
-                          className="transition-all shadow-md"
-                          disabled={isLoading || !input.trim()}
-                        >
-                          Send
-                        </Button>
-                      )}
                     </div>
                   </form>
                 </div>

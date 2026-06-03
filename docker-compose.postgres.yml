@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: pfg-postgres
+    environment:
+      POSTGRES_DB: pfg_app
+      POSTGRES_USER: pfg
+      POSTGRES_PASSWORD: pfg_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pfg -d pfg_app"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+    driver: local

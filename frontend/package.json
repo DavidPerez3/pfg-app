@@ -6,8 +6,11 @@
     "apps/*"
   ],
   "scripts": {
-    "dev": "concurrently \"turbo dev --filter=web\" \"turbo dev --filter=agents\"",
+    "dev": "turbo dev --filter=web",
+    "dev:agents": "turbo dev --filter=agents",
+    "dev:full": "concurrently \"turbo dev --filter=web\" \"turbo dev --filter=agents\"",
     "build": "turbo build",
+    "test:web": "npm run test --workspace=web",
     "turbo:command": "turbo",
     "format": "turbo format",
     "lint": "turbo lint",

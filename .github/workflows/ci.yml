@@ -1,0 +1,123 @@
+name: PFG App CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: pfg-app-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend-web-build:
+    name: Frontend web build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Build active web app
+        run: npx turbo build --filter=web
+        working-directory: frontend
+
+  frontend-web-tests:
+    name: Frontend web tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Run web unit tests
+        run: npm run test:web
+        working-directory: frontend
+
+  python-syntax-check:
+    name: Python syntax check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Compile backend, recommender, and shared Python sources
+        run: |
+          python - <<'PY'
+          import pathlib
+          import py_compile
+          import sys
+
+          roots = ["backend", "recommender", "shared"]
+          failures = []
+          checked = 0
+
+          for root in roots:
+              for path in pathlib.Path(root).rglob("*.py"):
+                  if any(part in {".venv", "__pycache__"} for part in path.parts):
+                      continue
+                  checked += 1
+                  try:
+                      py_compile.compile(str(path), doraise=True)
+                  except Exception as exc:
+                      failures.append((str(path), str(exc)))
+
+          print(f"Checked {checked} Python files.")
+          if failures:
+              for path, error in failures:
+                  print(f"[FAIL] {path}: {error}", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+  python-unit-and-contract-tests:
+    name: Python unit and contract tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install backend and recommender dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt
+          python -m pip install -r recommender/requirements.txt
+          python -m pip install -r test-requirements.txt
+
+      - name: Run backend unit and contract tests
+        run: python -m unittest discover -s backend/tests -p "test_*.py"
+
+      - name: Run recommender contract tests
+        run: python -m unittest discover -s recommender/tests -p "test_api_contracts.py" -v

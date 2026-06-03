@@ -1,0 +1,9 @@
+node_modules
+apps/web/node_modules
+apps/web/.next
+apps/web/.turbo
+apps/agents/node_modules
+apps/agents/dist
+apps/agents/.turbo
+**/.env
+**/.env.*
