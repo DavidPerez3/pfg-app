@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import os
+import time
 from typing import Any
 
 import requests
@@ -8,7 +11,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from agent import graph
 from config import settings
-from hitl_utils import build_hitl_refinement_context, is_recommendation_refinement
+from hitl_utils import (
+    build_hitl_refinement_context,
+    build_recommendation_follow_up_context,
+    is_recommendation_context_follow_up,
+    is_recommendation_refinement,
+)
+from mcp_bridge import project_mcp_health
 from memory_manager import memory_manager
 from shared.contracts import (
     ChatMessage,
@@ -18,10 +27,13 @@ from shared.contracts import (
     FeedbackRequest,
     FeedbackResponse,
     FeedbackSummary,
+    LatencyTelemetry,
     MemoryResponse,
     ShortTermMemoryResponse,
 )
 from state_store import store
+
+log = logging.getLogger("backend")
 
 
 app = FastAPI(title="PFG App Backend", version="0.3.0")
@@ -77,6 +89,37 @@ def _message_to_contract(message: Any) -> ChatMessage:
     )
 
 
+def _summarize_recommendation_result_for_storage(
+    result_payload: Any,
+    fallback_assistant_message: str,
+) -> str:
+    fallback = str(fallback_assistant_message or "").strip()
+    if not isinstance(result_payload, dict) or result_payload.get("kind") != "recommendations":
+        return fallback
+
+    parts: list[str] = []
+    if fallback:
+        parts.append(fallback)
+
+    explanation = str(result_payload.get("explanation") or "").strip()
+    if explanation and explanation != fallback:
+        parts.append(explanation.replace("\n", " "))
+
+    items = result_payload.get("items", [])
+    if isinstance(items, list):
+        titles: list[str] = []
+        for item in items[:5]:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or item.get("item_name") or "").strip()
+            if title:
+                titles.append(title)
+        if titles:
+            parts.append("Top recommended items: " + "; ".join(titles) + ".")
+
+    return " ".join(part for part in parts if part).strip()
+
+
 def _check_http_health(url: str, *, optional: bool = False) -> str:
     try:
         response = requests.get(url, timeout=3)
@@ -87,6 +130,16 @@ def _check_http_health(url: str, *, optional: bool = False) -> str:
         if optional:
             return f"optional-unavailable: {exc}"
         return f"error: {exc}"
+
+
+def _llm_runtime_health() -> str:
+    provider = getattr(settings, "backend_llm_provider", "gemini")
+    if provider == "gemini":
+        has_key = bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+        if not has_key:
+            return "misconfigured: missing GEMINI_API_KEY/GOOGLE_API_KEY"
+        return f"configured: gemini ({settings.backend_gemini_model})"
+    return _check_http_health(f"{settings.ollama_base_url}/api/tags", optional=True)
 
 
 @app.get("/")
@@ -139,7 +192,8 @@ def health_detailed():
         "short_term_memory": memory_manager.short_term_health()["status"],
         "long_term_memory": memory_manager.long_term_health()["status"],
         "recommender": _check_http_health(f"{settings.recommender_base_url}{API_V1_PREFIX}/health"),
-        "ollama": _check_http_health(f"{settings.ollama_base_url}/api/tags", optional=True),
+        "llm_runtime": _llm_runtime_health(),
+        "benchmark_mcp": project_mcp_health(),
     }
     mandatory = [checks["app_state_store"], checks["recommender"]]
     overall = "ok" if all(value == "ok" for value in mandatory) else "degraded"
@@ -154,6 +208,7 @@ def health_detailed():
 
 
 async def _chat_impl(request: ChatRequest, *, thread_id_override: str | None = None):
+    started = time.perf_counter()
     try:
         thread_id = thread_id_override or request.thread_id or "default-thread"
         user_id = request.user_id or "anonymous"
@@ -164,7 +219,16 @@ async def _chat_impl(request: ChatRequest, *, thread_id_override: str | None = N
         latest_feedback = store.get_latest_feedback(thread_id)
         latest_recommendation_event = store.get_latest_recommendation_event(thread_id)
         hitl_refinement_context = None
+        recommendation_follow_up_context = None
 
+        if latest_recommendation_event and is_recommendation_context_follow_up(latest_user_message):
+            recommendation_follow_up_context = build_recommendation_follow_up_context(
+                latest_user_prompt=str(latest_recommendation_event.get("user_message") or ""),
+                latest_assistant_text=str(
+                    latest_recommendation_event.get("assistant_message") or ""
+                ),
+                latest_feedback=latest_feedback,
+            )
         if is_recommendation_refinement(latest_user_message) and latest_recommendation_event:
             hitl_refinement_context = build_hitl_refinement_context(
                 latest_user_prompt=str(latest_recommendation_event.get("user_message") or ""),
@@ -186,6 +250,17 @@ async def _chat_impl(request: ChatRequest, *, thread_id_override: str | None = N
                 + "\n".join(f"- {fact}" for fact in relevant_memory)
             )
             input_messages = [{"role": "system", "content": memory_prompt}] + input_messages
+
+        if recommendation_follow_up_context and not hitl_refinement_context:
+            input_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Recommendation follow-up context for this thread:\n"
+                        + recommendation_follow_up_context
+                    ),
+                }
+            ] + input_messages
 
         if hitl_refinement_context:
             input_messages = [
@@ -216,8 +291,13 @@ async def _chat_impl(request: ChatRequest, *, thread_id_override: str | None = N
 
         result = graph.invoke({"messages": input_messages}, config=config)
         response_messages = [_message_to_contract(msg) for msg in result.get("messages", [])]
+        result_payload = result.get("result")
 
         if request.messages and response_messages:
+            assistant_message_for_storage = _summarize_recommendation_result_for_storage(
+                result_payload,
+                response_messages[-1].content,
+            )
             store.record_conversation_event(
                 thread_id=thread_id,
                 user_id=user_id,
@@ -226,12 +306,42 @@ async def _chat_impl(request: ChatRequest, *, thread_id_override: str | None = N
                 dataset=selected_dataset,
                 rec_model=selected_model,
                 user_message=request.messages[-1].content,
-                assistant_message=response_messages[-1].content,
+                assistant_message=assistant_message_for_storage,
             )
 
         new_facts = memory_manager.extract_candidate_facts(latest_user_message)
         if new_facts:
             memory_manager.store_facts(user_id, new_facts, source="chat")
+
+        backend_total_ms = round((time.perf_counter() - started) * 1000, 2)
+        client_to_backend_ms = None
+        if request.client_sent_at_ms is not None:
+            client_to_backend_ms = round((time.time() * 1000) - float(request.client_sent_at_ms), 2)
+
+        result_latency = None
+        if isinstance(result_payload, dict):
+            maybe_latency = result_payload.get("latency")
+            if isinstance(maybe_latency, dict):
+                result_latency = LatencyTelemetry.model_validate(maybe_latency)
+
+        response_latency = LatencyTelemetry(
+            client_to_backend_ms=client_to_backend_ms,
+            backend_total_ms=backend_total_ms,
+            backend_to_recommender_http_ms=(
+                result_latency.backend_to_recommender_http_ms if result_latency else None
+            ),
+            recommender_total_ms=(
+                result_latency.recommender_total_ms if result_latency else None
+            ),
+        )
+        log.info(
+            "[LATENCY][backend.chat] trace_id=%r backend_total_ms=%s client_to_backend_ms=%s backend_to_recommender_http_ms=%s recommender_total_ms=%s",
+            result.get("trace_id") or request.trace_id,
+            backend_total_ms,
+            client_to_backend_ms,
+            response_latency.backend_to_recommender_http_ms,
+            response_latency.recommender_total_ms,
+        )
 
         return ChatResponse(
             messages=response_messages,
@@ -241,7 +351,8 @@ async def _chat_impl(request: ChatRequest, *, thread_id_override: str | None = N
             rec_model=result.get("result", {}).get("rec_model")
             if isinstance(result.get("result"), dict)
             else selected_model,
-            result=result.get("result"),
+            result=result_payload,
+            latency=response_latency,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -271,23 +382,43 @@ async def submit_thread_feedback(thread_id: str, request: FeedbackRequest):
 
 
 @app.get("/dataset-users", response_model=DatasetUsersResponse)
-async def dataset_users(dataset: str | None = None, limit: int = 25):
+async def dataset_users(dataset: str | None = None, limit: int = 25, rec_model: str | None = None):
+    started = time.perf_counter()
     target_dataset = dataset or settings.default_dataset
     try:
+        remote_started = time.perf_counter()
         response = requests.get(
             f"{settings.recommender_base_url}{API_V1_PREFIX}/datasets/{target_dataset}/users",
-            params={"limit": limit},
+            params={"limit": limit, "rec_model": rec_model},
             timeout=10,
         )
         response.raise_for_status()
-        return DatasetUsersResponse.model_validate(response.json())
+        payload = DatasetUsersResponse.model_validate(response.json())
+        remote_ms = round((time.perf_counter() - remote_started) * 1000, 2)
+        recommender_total_ms = payload.latency.recommender_total_ms if payload.latency else None
+        log.info(
+            "[LATENCY][backend.dataset_users] dataset=%r backend_total_ms=%s backend_to_recommender_http_ms=%s recommender_total_ms=%s",
+            target_dataset,
+            round((time.perf_counter() - started) * 1000, 2),
+            remote_ms,
+            recommender_total_ms,
+        )
+        return payload.model_copy(
+            update={
+                "latency": LatencyTelemetry(
+                    backend_total_ms=round((time.perf_counter() - started) * 1000, 2),
+                    backend_to_recommender_http_ms=remote_ms,
+                    recommender_total_ms=recommender_total_ms,
+                )
+            }
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get(f"{API_V1_PREFIX}/datasets/{{dataset}}/users", response_model=DatasetUsersResponse)
-async def dataset_users_v1(dataset: str, limit: int = 25):
-    return await dataset_users(dataset=dataset, limit=limit)
+async def dataset_users_v1(dataset: str, limit: int = 25, rec_model: str | None = None):
+    return await dataset_users(dataset=dataset, limit=limit, rec_model=rec_model)
 
 
 @app.get(f"{API_V1_PREFIX}/feedback/summary", response_model=FeedbackSummary)

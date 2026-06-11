@@ -9,6 +9,7 @@ Application layer of the recommender-system PFG.
 | `frontend/apps/web` | `3000` | User-facing chat UI, login, thread history, architecture page, API reference page |
 | `backend` | `8000` | Public FastAPI backend with chat, health, feedback, memory, and session endpoints |
 | `recommender` | `8001` | Model-serving API for recommendation, item similarity, and search |
+| `mcp_server` | `8010` | Minimal real MCP service exposing structured project/runtime knowledge |
 
 ## Main URLs
 
@@ -20,12 +21,15 @@ Application layer of the recommender-system PFG.
 | `http://localhost:8000/docs` | Backend Swagger UI |
 | `http://localhost:8000/health/detailed` | Backend readiness check |
 | `http://localhost:8001/health/detailed` | Recommender readiness check |
+| `http://localhost:8010/health` | Benchmark MCP health check |
+| `http://localhost:8010/capabilities` | Benchmark MCP capabilities summary |
 
 ## Architecture summary
 
 - `frontend`: product-facing user interface.
 - `backend`: orchestration and application-state layer.
 - `recommender`: specialized model-serving layer.
+- `mcp_server`: minimal MCP-compatible knowledge service consumed by the backend for project/runtime questions.
 
 This separation is intentionally similar to the reference project pattern: clear public API, explicit health checks, and visible architecture documentation.
 
@@ -76,16 +80,25 @@ Legacy aliases are still available during migration, including `/search`, `/mf`,
 - Application-state persistence now targets `PostgreSQL` through a SQL-backed store abstraction.
 - A SQLite URL is still supported as a transitional local fallback and as the source for one-off migration into PostgreSQL.
 - `Elasticsearch` is now used in the active app path for semantic retrieval in `LLM + RAG` and for entity lookup, while `Parquet` and model weights remain read-only serving artifacts.
-- The `LLM + RAG` reranker can now target either a local `Ollama` backend or the Gemini API through a server-side `GEMINI_API_KEY` / `GOOGLE_API_KEY`, which makes the experimental path viable on servers where Ollama cannot be installed.
+- The conversational backend now prefers Gemini for application-side LLM tasks when `GEMINI_API_KEY` / `GOOGLE_API_KEY` is available, while the recommender-side `LLM + RAG` path also defaults to Gemini and still keeps Ollama as an optional fallback.
 - The backend now distinguishes:
   - `short-term memory`: recent thread/session history derived from persisted conversation events,
   - `long-term memory`: user preference facts stored in the SQL app-state database and semantically retrievable through Elasticsearch.
+- A minimal real MCP integration is now part of the implementation:
+  - `mcp_server/main.py` exposes standard MCP resources plus the `answer_project_question` MCP tool.
+  - `backend/mcp_bridge.py` consumes that service through the official MCP Python client over Streamable HTTP.
+  - The backend uses this path for project-capability questions such as supported datasets, models, architecture, deployment, and provider strategy.
 - A one-off migration script is available at `backend/scripts/migrate_sqlite_to_postgres.py`.
 
-## LLM + RAG provider switching
+## LLM provider switching
 
+- Backend conversational LLM:
+  - `BACKEND_LLM_PROVIDER=gemini|ollama`
+  - `BACKEND_GEMINI_MODEL=gemini-2.5-flash-lite`
+  - `OLLAMA_MODEL=llama3.2`
+  - `GEMINI_API_KEY=...` or `GOOGLE_API_KEY=...`
 - Recommender runtime:
-  - `RAG_LLM_PROVIDER=ollama|gemini`
+  - `RAG_LLM_PROVIDER=gemini|ollama`
   - `RAG_OLLAMA_MODEL=llama3.2`
   - `RAG_GEMINI_MODEL=gemini-2.5-flash-lite`
   - `GEMINI_API_KEY=...` or `GOOGLE_API_KEY=...`

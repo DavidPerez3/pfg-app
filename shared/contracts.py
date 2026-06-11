@@ -26,6 +26,13 @@ class RecommendedItem(BaseModel):
     genres: str = ""
 
 
+class LatencyTelemetry(BaseModel):
+    client_to_backend_ms: float | None = None
+    backend_total_ms: float | None = None
+    backend_to_recommender_http_ms: float | None = None
+    recommender_total_ms: float | None = None
+
+
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -36,6 +43,7 @@ class ChatRequest(BaseModel):
     thread_id: str | None = None
     user_id: str | None = None
     trace_id: str | None = None
+    client_sent_at_ms: float | None = None
     dataset: str | None = None
     rec_model: str | None = None
     dataset_user_id: str | None = None
@@ -55,6 +63,7 @@ class ChatResult(BaseModel):
     trace_id: str | None = None
     explanation: str | None = None
     follow_up_prompts: list[str] = Field(default_factory=list)
+    latency: LatencyTelemetry | None = None
 
 
 class ChatResponse(BaseModel):
@@ -64,6 +73,7 @@ class ChatResponse(BaseModel):
     dataset: str | None = None
     rec_model: str | None = None
     result: ChatResult | None = None
+    latency: LatencyTelemetry | None = None
 
 
 class RecommendRequest(BaseModel):
@@ -84,6 +94,7 @@ class RecommendResponse(BaseModel):
     items: list[RecommendedItem]
     trace_id: str | None = None
     explanation: str | None = None
+    latency: LatencyTelemetry | None = None
 
 
 class SearchRequest(BaseModel):
@@ -98,6 +109,7 @@ class SearchResponse(BaseModel):
     dataset: str
     results: list[RecommendedItem]
     trace_id: str | None = None
+    latency: LatencyTelemetry | None = None
 
 
 class SimilarRequest(BaseModel):
@@ -113,6 +125,7 @@ class SimilarResponse(BaseModel):
     model: str
     items: list[RecommendedItem]
     trace_id: str | None = None
+    latency: LatencyTelemetry | None = None
 
 
 class FeedbackRequest(BaseModel):
@@ -169,3 +182,4 @@ class DatasetUsersResponse(BaseModel):
     dataset: str
     users: list[DatasetUserOption] = Field(default_factory=list)
     total_available: int = 0
+    latency: LatencyTelemetry | None = None

@@ -41,6 +41,7 @@ export function AssistantMessage({
               variant="outline"
               size="sm"
               className="rounded-full"
+              data-testid="feedback-useful-button"
               disabled={feedbackState !== "idle"}
               onClick={() => onFeedback(5)}
             >
@@ -56,6 +57,7 @@ export function AssistantMessage({
               variant="outline"
               size="sm"
               className="rounded-full"
+              data-testid="feedback-needs-work-button"
               disabled={feedbackState !== "idle"}
               onClick={() => onFeedback(2)}
             >

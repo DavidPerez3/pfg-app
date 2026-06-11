@@ -128,9 +128,20 @@ export function Thread() {
   >({});
   const abortRef = useRef<AbortController | null>(null);
   const hasStoredDatasetPreference = useRef(false);
+  const hasManualDatasetSelection = useRef(false);
 
   const selectedDatasetUserId =
     selectedDatasetUsersByDataset[selectedDataset] ?? "";
+  const selectedDatasetLabel =
+    DATASET_OPTIONS.find((option) => option.value === selectedDataset)?.label ??
+    selectedDataset;
+  const selectedDatasetUserSummary = useMemo(
+    () =>
+      datasetUsers.find(
+        (user) => String(user.user_id) === String(selectedDatasetUserId),
+      ) ?? null,
+    [datasetUsers, selectedDatasetUserId],
+  );
 
   const stableUserId =
     session?.user?.email?.trim().toLowerCase() ??
@@ -189,7 +200,10 @@ export function Thread() {
         const payload = await response.json();
         const nextDataset = payload?.defaults?.dataset;
         if (!cancelled && typeof nextDataset === "string" && nextDataset.trim()) {
-          if (!hasStoredDatasetPreference.current) {
+          if (
+            !hasStoredDatasetPreference.current &&
+            !hasManualDatasetSelection.current
+          ) {
             setSelectedDataset(nextDataset);
           }
         }
@@ -223,8 +237,10 @@ export function Thread() {
     const loadDatasetUsers = async () => {
       setDatasetUsersLoading(true);
       try {
+        const requestStartedAt = performance.now();
         const params = new URLSearchParams({
           limit: "25",
+          rec_model: selectedRecModel,
         });
         const response = await fetch(
           `${backendBaseUrl}/api/v1/datasets/${selectedDataset}/users?${params.toString()}`,
@@ -238,6 +254,14 @@ export function Thread() {
           ? payload.users
           : [];
         setDatasetUsers(users);
+        console.info("[LATENCY][dataset-users]", {
+          dataset: selectedDataset,
+          frontend_roundtrip_ms: Number((performance.now() - requestStartedAt).toFixed(2)),
+          backend_total_ms: payload?.latency?.backend_total_ms ?? null,
+          backend_to_recommender_http_ms:
+            payload?.latency?.backend_to_recommender_http_ms ?? null,
+          recommender_total_ms: payload?.latency?.recommender_total_ms ?? null,
+        });
       } catch {
         if (!cancelled) {
           setDatasetUsers([]);
@@ -259,7 +283,7 @@ export function Thread() {
     return () => {
       cancelled = true;
     };
-  }, [selectedDataset]);
+  }, [backendBaseUrl, selectedDataset, selectedRecModel]);
 
   React.useEffect(() => {
     if (!selectedDatasetUserId) return;
@@ -307,12 +331,15 @@ export function Thread() {
     abortRef.current = new AbortController();
 
     try {
+      const clientSentAtMs = Date.now();
+      const requestStartedAt = performance.now();
       const response = await fetch(
         `${backendBaseUrl}/api/v1/threads/${resolvedThreadId}/messages`,
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
+            "X-Trace-Id": traceId,
           },
           signal: abortRef.current.signal,
           body: JSON.stringify({
@@ -323,6 +350,7 @@ export function Thread() {
             thread_id: resolvedThreadId,
             user_id: stableUserId,
             trace_id: traceId,
+            client_sent_at_ms: clientSentAtMs,
             dataset: selectedDataset,
             rec_model: selectedRecModel,
             dataset_user_id: selectedDatasetUserId || null,
@@ -336,6 +364,17 @@ export function Thread() {
       }
 
       const payload = await response.json();
+      console.info("[LATENCY][chat]", {
+        trace_id: traceId,
+        dataset: selectedDataset,
+        rec_model: selectedRecModel,
+        frontend_roundtrip_ms: Number((performance.now() - requestStartedAt).toFixed(2)),
+        client_to_backend_ms: payload?.latency?.client_to_backend_ms ?? null,
+        backend_total_ms: payload?.latency?.backend_total_ms ?? null,
+        backend_to_recommender_http_ms:
+          payload?.latency?.backend_to_recommender_http_ms ?? null,
+        recommender_total_ms: payload?.latency?.recommender_total_ms ?? null,
+      });
       const nextMessages = attachResultToLatestAssistant(
         mergeBackendMessages(
           optimisticMessages,
@@ -704,9 +743,9 @@ export function Thread() {
                       </h1>
                     </div>
                     <p className="max-w-xl text-center text-sm text-gray-600">
-                      This chat now talks directly to the public FastAPI backend.
                       Ask naturally for recommendations, similar items, or
-                      general questions.
+                      general questions. The assistant routes each turn through
+                      the benchmark backend and returns structured results.
                     </p>
                   </div>
                 )}
@@ -719,6 +758,7 @@ export function Thread() {
                     className="grid grid-rows-[1fr_auto] gap-2 max-w-3xl mx-auto"
                   >
                     <textarea
+                      data-testid="chat-input"
                       value={input}
                       onChange={(e) => setInput(e.target.value)}
                       onKeyDown={(e) => {
@@ -745,6 +785,7 @@ export function Thread() {
                             Paradigm
                           </span>
                           <select
+                            data-testid="rec-model-select"
                             value={selectedRecModel}
                             onChange={(event) =>
                               setSelectedRecModel(
@@ -765,10 +806,12 @@ export function Thread() {
                             Dataset
                           </span>
                           <select
+                            data-testid="dataset-select"
                             value={selectedDataset}
-                            onChange={(event) =>
-                              setSelectedDataset(event.target.value)
-                            }
+                            onChange={(event) => {
+                              hasManualDatasetSelection.current = true;
+                              setSelectedDataset(event.target.value);
+                            }}
                             className="rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-sm outline-none transition focus:border-slate-400"
                           >
                             {DATASET_OPTIONS.map((option) => (
@@ -783,6 +826,7 @@ export function Thread() {
                             Dataset user
                           </span>
                           <select
+                            data-testid="dataset-user-select"
                             value={selectedDatasetUserId}
                             onChange={(event) =>
                               setSelectedDatasetUsersByDataset((prev) => {
@@ -816,6 +860,7 @@ export function Thread() {
                             onClick={handleCancel}
                             type="button"
                             className="self-end"
+                            data-testid="cancel-button"
                           >
                             <LoaderCircle className="w-4 h-4 animate-spin" />
                             Cancel
@@ -825,10 +870,52 @@ export function Thread() {
                             type="submit"
                             className="self-end transition-all shadow-md"
                             disabled={!input.trim()}
+                            data-testid="send-button"
                           >
                             Send
                           </Button>
                         )}
+                      </div>
+                      <div
+                        data-testid="benchmark-mode-copy"
+                        className="grid gap-2 rounded-2xl border border-slate-200/90 bg-slate-50/90 px-4 py-3 text-xs leading-5 text-slate-600 sm:grid-cols-3"
+                      >
+                        <div>
+                          <span className="block text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">
+                            App user
+                          </span>
+                          <p className="mt-1">
+                            Your signed-in account is{" "}
+                            <span className="font-medium text-slate-800">
+                              {stableUserId}
+                            </span>
+                            . It owns this chat thread, memory, and feedback.
+                          </p>
+                        </div>
+                        <div>
+                          <span className="block text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">
+                            Benchmark mode
+                          </span>
+                          <p className="mt-1">
+                            The <span className="font-medium text-slate-800">Dataset user</span>{" "}
+                            selector does not switch your account. It injects an
+                            offline-trained profile from{" "}
+                            <span className="font-medium text-slate-800">
+                              {selectedDatasetLabel}
+                            </span>{" "}
+                            for experimental non-cold-start checks.
+                          </p>
+                        </div>
+                        <div>
+                          <span className="block text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">
+                            Active profile
+                          </span>
+                          <p className="mt-1">
+                            {selectedDatasetUserSummary
+                              ? `Using dataset user ${selectedDatasetUserSummary.user_id} (${selectedDatasetUserSummary.interaction_count} interactions).`
+                              : `No dataset user selected for ${selectedDatasetLabel}; recommendations run in cold-start mode.`}
+                          </p>
+                        </div>
                       </div>
                     </div>
                   </form>

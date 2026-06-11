@@ -44,8 +44,33 @@ class RecommenderApiContractsTests(unittest.TestCase):
         self.assertEqual(payload["dataset"], "movielens")
         self.assertEqual(len(payload["users"]), 2)
         self.assertEqual(payload["total_available"], 3)
+        self.assertIn("latency", payload)
+        self.assertGreaterEqual(payload["latency"]["recommender_total_ms"], 0)
         response_v1 = self.client.get("/api/v1/datasets/movielens/users?limit=2")
         self.assertEqual(response_v1.status_code, 200)
+
+    @patch.object(recommender_main, "_mf_trained_dataset_user_ids")
+    @patch.object(recommender_main, "_dataset_user_options")
+    def test_dataset_users_filters_to_mf_servable_users_when_model_is_mf(
+        self,
+        mock_options,
+        mock_trained_user_ids,
+    ):
+        mock_options.return_value = (
+            [
+                recommender_main.DatasetUserOption(user_id="20", interaction_count=20),
+                recommender_main.DatasetUserOption(user_id="10", interaction_count=15),
+                recommender_main.DatasetUserOption(user_id="30", interaction_count=12),
+            ],
+            3,
+        )
+        mock_trained_user_ids.return_value = frozenset({"10", "30"})
+
+        response = self.client.get("/api/v1/datasets/movielens/users?limit=25&rec_model=mf")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total_available"], 2)
+        self.assertEqual([user["user_id"] for user in payload["users"]], ["10", "30"])
 
     @patch.object(recommender_main, "_search_items_from_parquet")
     @patch.object(recommender_main, "_search_items_from_elasticsearch")
@@ -71,6 +96,8 @@ class RecommenderApiContractsTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["query"], "matrix")
         self.assertEqual(payload["results"][0]["title"], "The Matrix")
+        self.assertIn("latency", payload)
+        self.assertGreaterEqual(payload["latency"]["recommender_total_ms"], 0)
         mock_search_parquet.assert_called_once()
         response_v1 = self.client.get(
             "/api/v1/datasets/movielens/items/search?q=matrix&limit=5",
@@ -101,6 +128,31 @@ class RecommenderApiContractsTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         mock_mf_recommend.assert_called_once()
+        self.assertIn("latency", response.json())
+
+    def test_mf_recommendation_returns_standard_run_not_trained_message(self):
+        with patch.object(recommender_main, "MODELS_ROOT", Path("C:/definitely-missing-pfg-model-weights")):
+            response = self.client.post(
+                "/api/v1/recommenders/matrix-factorization/recommendations",
+                json={"user_id": "u1", "dataset": "movielens", "prompt": "recommend", "top_k": 10},
+            )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            response.json()["detail"],
+            "Run not trained: Matrix Factorization is not available for dataset 'movielens'.",
+        )
+
+    def test_mf_similarity_returns_standard_run_not_trained_message(self):
+        with patch.object(recommender_main, "MODELS_ROOT", Path("C:/definitely-missing-pfg-model-weights")):
+            response = self.client.post(
+                "/api/v1/recommenders/matrix-factorization/similar-items",
+                json={"item_title": "The Matrix", "dataset": "movielens", "top_k": 10},
+            )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            response.json()["detail"],
+            "Run not trained: Matrix Factorization is not available for dataset 'movielens'.",
+        )
 
     def test_versioned_model_health_rejects_unknown_model(self):
         response = self.client.get("/api/v1/recommenders/unknown-model/health")

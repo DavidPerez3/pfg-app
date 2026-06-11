@@ -121,3 +121,175 @@ jobs:
 
       - name: Run recommender contract tests
         run: python -m unittest discover -s recommender/tests -p "test_api_contracts.py" -v
+
+  python-service-smoke-tests:
+    name: Python service smoke tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: pfg_app
+          POSTGRES_USER: pfg
+          POSTGRES_PASSWORD: pfg_dev_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pfg -d pfg_app"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.12.2
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          xpack.security.http.ssl.enabled: "false"
+          ES_JAVA_OPTS: -Xms1g -Xmx1g
+        ports:
+          - 9200:9200
+
+    env:
+      APP_STATE_DATABASE_URL: postgresql+psycopg://pfg:pfg_dev_password@localhost:5432/pfg_app
+      ELASTICSEARCH_URL: http://localhost:9200
+      RECOMMENDER_BASE_URL: http://localhost:8001
+      BENCHMARK_MCP_URL: http://localhost:8010/mcp
+      FRONTEND_ORIGINS: http://localhost:3000
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install backend and recommender dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt
+          python -m pip install -r recommender/requirements.txt
+          python -m pip install -r test-requirements.txt
+
+      - name: Prepare minimal CI smoke fixtures
+        run: python scripts/prepare_ci_smoke_fixtures.py
+
+      - name: Start recommender
+        run: |
+          nohup python -m uvicorn main:app --host 0.0.0.0 --port 8001 > ../recommender-smoke.log 2>&1 &
+        working-directory: recommender
+
+      - name: Start benchmark MCP
+        run: |
+          nohup python -m uvicorn main:app --host 0.0.0.0 --port 8010 > ../benchmark-mcp-smoke.log 2>&1 &
+        working-directory: mcp_server
+
+      - name: Start backend
+        run: |
+          nohup python -m uvicorn main:app --host 0.0.0.0 --port 8000 > ../backend-smoke.log 2>&1 &
+        working-directory: backend
+
+      - name: Run service smoke checks
+        run: python scripts/smoke_stack.py
+
+  frontend-browser-acceptance-tests:
+    name: Frontend browser acceptance tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: pfg_app
+          POSTGRES_USER: pfg
+          POSTGRES_PASSWORD: pfg_dev_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pfg -d pfg_app"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.12.2
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          xpack.security.http.ssl.enabled: "false"
+          ES_JAVA_OPTS: -Xms1g -Xmx1g
+        ports:
+          - 9200:9200
+
+    env:
+      APP_STATE_DATABASE_URL: postgresql+psycopg://pfg:pfg_dev_password@localhost:5432/pfg_app
+      ELASTICSEARCH_URL: http://localhost:9200
+      RECOMMENDER_BASE_URL: http://localhost:8001
+      BENCHMARK_MCP_URL: http://localhost:8010/mcp
+      FRONTEND_ORIGINS: http://localhost:3000
+      E2E_BYPASS_AUTH: "true"
+      AUTH_SECRET: dummy-auth-secret-for-e2e
+      AUTH_GITHUB_ID: dummy-github-id
+      AUTH_GITHUB_SECRET: dummy-github-secret
+      AUTH_GOOGLE_ID: dummy-google-id
+      AUTH_GOOGLE_SECRET: dummy-google-secret
+      AUTH_TRUST_HOST: "true"
+      NEXTAUTH_URL: http://127.0.0.1:3000
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install backend and recommender dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt
+          python -m pip install -r recommender/requirements.txt
+          python -m pip install -r test-requirements.txt
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+        working-directory: frontend
+
+      - name: Prepare minimal CI smoke fixtures
+        run: python scripts/prepare_ci_smoke_fixtures.py
+
+      - name: Build active web app
+        run: npm run build --workspace=web
+        working-directory: frontend
+
+      - name: Start recommender
+        run: |
+          nohup python -m uvicorn main:app --host 0.0.0.0 --port 8001 > ../recommender-e2e.log 2>&1 &
+        working-directory: recommender
+
+      - name: Start benchmark MCP
+        run: |
+          nohup python -m uvicorn main:app --host 0.0.0.0 --port 8010 > ../benchmark-mcp-e2e.log 2>&1 &
+        working-directory: mcp_server
+
+      - name: Start backend
+        run: |
+          nohup python -m uvicorn main:app --host 0.0.0.0 --port 8000 > ../backend-e2e.log 2>&1 &
+        working-directory: backend
+
+      - name: Run browser acceptance tests
+        run: npm run test:e2e
+        working-directory: frontend

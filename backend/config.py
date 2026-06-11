@@ -27,6 +27,10 @@ class Settings:
     recommender_base_url: str
     ollama_base_url: str
     elasticsearch_url: str
+    benchmark_mcp_url: str
+    backend_llm_provider: str
+    backend_ollama_model: str
+    backend_gemini_model: str
     default_dataset: str
     default_rec_model: str
     app_state_database_url: str
@@ -53,6 +57,10 @@ settings = Settings(
     recommender_base_url=os.getenv("RECOMMENDER_BASE_URL", "http://localhost:8001").rstrip("/"),
     ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/"),
     elasticsearch_url=os.getenv("ELASTICSEARCH_URL", "http://localhost:9200").rstrip("/"),
+    benchmark_mcp_url=os.getenv("BENCHMARK_MCP_URL", "http://localhost:8010/mcp").rstrip("/"),
+    backend_llm_provider=os.getenv("BACKEND_LLM_PROVIDER", "gemini").strip().lower(),
+    backend_ollama_model=os.getenv("OLLAMA_MODEL", "llama3.2"),
+    backend_gemini_model=os.getenv("BACKEND_GEMINI_MODEL", "gemini-2.5-flash-lite"),
     default_dataset=os.getenv("DEFAULT_DATASET", "movielens"),
     default_rec_model=os.getenv("DEFAULT_REC_MODEL", "mf"),
     app_state_database_url=_default_app_state_database_url(),

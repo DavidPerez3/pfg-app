@@ -16,6 +16,13 @@ export interface AppRecommendedItem {
   genres?: string;
 }
 
+export interface AppLatencyTelemetry {
+  client_to_backend_ms?: number | null;
+  backend_total_ms?: number | null;
+  backend_to_recommender_http_ms?: number | null;
+  recommender_total_ms?: number | null;
+}
+
 export interface AppStructuredResult {
   kind: AppResultKind;
   title: string;
@@ -30,6 +37,7 @@ export interface AppStructuredResult {
   trace_id?: string;
   explanation?: string | null;
   follow_up_prompts?: string[];
+  latency?: AppLatencyTelemetry | null;
 }
 
 export interface AppMessage {
@@ -57,4 +65,5 @@ export interface DatasetUsersResponse {
   dataset: string;
   users: DatasetUserOption[];
   total_available: number;
+  latency?: AppLatencyTelemetry | null;
 }

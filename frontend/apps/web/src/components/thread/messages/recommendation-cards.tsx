@@ -25,7 +25,7 @@ export function RecommendationCards({
   if (!result.items.length) return null;
 
   return (
-    <div className="mt-4 flex w-full flex-col gap-3">
+    <div data-testid="structured-result" className="mt-4 flex w-full flex-col gap-3">
       <div className="flex flex-col gap-1">
         <h3 className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-500">
           {result.title}
@@ -53,11 +53,15 @@ export function RecommendationCards({
           return (
             <Card
               key={`${result.kind}-${item.title}-${index}`}
+              data-testid="result-item-card"
               className="gap-4 border-slate-200 bg-white/95 py-4 shadow-[0_16px_40px_-28px_rgba(15,23,42,0.45)]"
             >
               <CardHeader className="gap-3 px-4">
                 <div className="flex items-start justify-between gap-4">
-                  <CardTitle className="text-base leading-6 text-slate-900">
+                  <CardTitle
+                    data-testid="result-item-title"
+                    className="text-base leading-6 text-slate-900"
+                  >
                     {item.title}
                   </CardTitle>
                   <span className="rounded-full border border-amber-300 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-amber-700">
@@ -97,6 +101,7 @@ export function RecommendationCards({
             {result.follow_up_prompts.map((prompt) => (
               <Button
                 key={prompt}
+                data-testid="follow-up-prompt-button"
                 type="button"
                 size="sm"
                 variant="outline"

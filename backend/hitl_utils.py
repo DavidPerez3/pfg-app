@@ -23,12 +23,41 @@ REFINEMENT_MARKERS = (
     "similar but ",
 )
 
+RECOMMENDATION_CONTEXT_MARKERS = (
+    "which one",
+    "which of these",
+    "which of them",
+    "out of these",
+    "from these",
+    "among these",
+    "why these",
+    "why this list",
+    "explain these",
+    "explain this list",
+    "start with",
+    "best one",
+    "first one",
+    "pick one",
+    "why did you recommend",
+    "what's the difference",
+    "what is the difference",
+)
+
 
 def is_recommendation_refinement(text: str) -> bool:
     normalized = " ".join(text.lower().strip().split())
     if not normalized:
         return False
     return any(marker in normalized for marker in REFINEMENT_MARKERS)
+
+
+def is_recommendation_context_follow_up(text: str) -> bool:
+    normalized = " ".join(text.lower().strip().split())
+    if not normalized:
+        return False
+    if is_recommendation_refinement(normalized):
+        return True
+    return any(marker in normalized for marker in RECOMMENDATION_CONTEXT_MARKERS)
 
 
 def build_hitl_refinement_context(
@@ -71,6 +100,38 @@ def build_hitl_refinement_context(
     parts.append(
         "Treat the current message as a refinement of the previous recommendation, "
         "not as an unrelated request."
+    )
+    return "\n".join(parts)
+
+
+def build_recommendation_follow_up_context(
+    *,
+    latest_user_prompt: str | None,
+    latest_assistant_text: str | None,
+    latest_feedback: dict[str, Any] | None,
+) -> str | None:
+    parts: list[str] = []
+
+    if latest_user_prompt and latest_user_prompt.strip():
+        parts.append(f"Previous recommendation request: {latest_user_prompt.strip()}")
+
+    if latest_assistant_text and latest_assistant_text.strip():
+        parts.append(
+            "Previous recommendation details: "
+            + latest_assistant_text.strip().replace("\n", " ")
+        )
+
+    if latest_feedback:
+        comment = str(latest_feedback.get("comment") or "").strip()
+        if comment:
+            parts.append(f"Latest user feedback note: {comment}")
+
+    if not parts:
+        return None
+
+    parts.append(
+        "The current user message refers to the previous recommendation list. "
+        "Use that prior list as conversational context when answering, comparing, or refining."
     )
     return "\n".join(parts)
 

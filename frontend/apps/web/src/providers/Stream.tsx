@@ -191,11 +191,11 @@ const StreamSession = ({
   useEffect(() => {
     checkGraphStatus(apiUrl, apiKey).then((ok) => {
       if (!ok) {
-        toast.error("Failed to connect to LangGraph server", {
+        toast.error("Failed to connect to the conversation backend", {
           description: () => (
             <p>
-              Please ensure your graph is running at <code>{apiUrl}</code> and
-              your API key is correctly set (if connecting to a deployed graph).
+              Please ensure the backend runtime is reachable at <code>{apiUrl}</code>{" "}
+              and that your API key is correctly set if needed.
             </p>
           ),
           duration: 10000,

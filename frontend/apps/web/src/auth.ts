@@ -5,12 +5,12 @@ import Google from "next-auth/providers/google";
 export const { handlers, signIn, signOut, auth } = NextAuth({
   providers: [
     GitHub({
-      clientId: process.env.AUTH_GITHUB_ID!,
-      clientSecret: process.env.AUTH_GITHUB_SECRET!,
+      clientId: process.env.AUTH_GITHUB_ID || "dummy-github-id",
+      clientSecret: process.env.AUTH_GITHUB_SECRET || "dummy-github-secret",
     }),
     Google({
-      clientId: process.env.AUTH_GOOGLE_ID!,
-      clientSecret: process.env.AUTH_GOOGLE_SECRET!,
+      clientId: process.env.AUTH_GOOGLE_ID || "dummy-google-id",
+      clientSecret: process.env.AUTH_GOOGLE_SECRET || "dummy-google-secret",
     }),
   ],
   pages: {

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -12,6 +13,10 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+except Exception:  # pragma: no cover - optional dependency in some environments
+    ChatGoogleGenerativeAI = None
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -33,6 +38,7 @@ if str(APP_ROOT) not in sys.path:
 
 from config import settings  # noqa: E402
 from hitl_utils import build_follow_up_prompts  # noqa: E402
+from mcp_bridge import fetch_project_context_sync, looks_like_project_context_question  # noqa: E402
 from shared.contracts import IntentClassification, RecommendRequest  # noqa: E402
 
 
@@ -67,6 +73,92 @@ MODEL_ENDPOINT_MAP = {
 
 SUPPORTED_DATASETS = {"movielens", "amazon_electronics", "yelp", "lastfm", "foursquare"}
 SUPPORTED_REC_MODELS = set(MODEL_ENDPOINT_MAP.keys())
+VALID_INTENTS = {"user_recommendation", "entity_lookup", "item_similarity", "general_qa"}
+INTENT_ALIASES = {
+    "recommendation": "user_recommendation",
+    "recommend": "user_recommendation",
+    "recommendations": "user_recommendation",
+    "userrecommendation": "user_recommendation",
+    "lookup": "entity_lookup",
+    "entitylookup": "entity_lookup",
+    "search": "entity_lookup",
+    "find": "entity_lookup",
+    "similar": "item_similarity",
+    "similarity": "item_similarity",
+    "itemsimilarity": "item_similarity",
+    "qa": "general_qa",
+    "general": "general_qa",
+    "question_answering": "general_qa",
+}
+GENRE_THEME_TERMS = {
+    "action",
+    "adventure",
+    "animation",
+    "children",
+    "comedy",
+    "crime",
+    "documentary",
+    "drama",
+    "fantasy",
+    "horror",
+    "musical",
+    "mystery",
+    "noir",
+    "romance",
+    "romantic",
+    "sci fi",
+    "sci-fi",
+    "scifi",
+    "science fiction",
+    "thriller",
+    "thrillers",
+    "war",
+    "western",
+}
+PREFERENCE_STATEMENT_PREFIXES = (
+    "i like ",
+    "i love ",
+    "i prefer ",
+    "i enjoy ",
+    "my favorite",
+    "my favourite",
+    "i don't like ",
+    "i do not like ",
+    "i hate ",
+)
+
+
+def _backend_llm_provider() -> str:
+    provider = (settings.backend_llm_provider or "gemini").strip().lower()
+    return provider if provider in {"gemini", "ollama"} else "gemini"
+
+
+def _backend_llm_model_name(provider: str | None = None) -> str:
+    chosen = provider or _backend_llm_provider()
+    return settings.backend_gemini_model if chosen == "gemini" else settings.backend_ollama_model
+
+
+def _gemini_api_key() -> str:
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("Set GEMINI_API_KEY or GOOGLE_API_KEY to use Gemini in the backend chatbot.")
+    return api_key
+
+
+def _build_backend_chat_llm(temperature: float = 0, tools: list | None = None):
+    provider = _backend_llm_provider()
+    if provider == "gemini":
+        if ChatGoogleGenerativeAI is None:
+            raise RuntimeError("langchain-google-genai is not installed for Gemini backend execution.")
+        llm = ChatGoogleGenerativeAI(
+            model=_backend_llm_model_name(provider),
+            google_api_key=_gemini_api_key(),
+            temperature=temperature,
+        )
+        return llm.bind_tools(tools) if tools else llm
+
+    llm = ChatOllama(model=_backend_llm_model_name(provider), temperature=temperature)
+    return llm.bind_tools(tools) if tools else llm
 
 
 def _configurable(config: RunnableConfig | None) -> dict[str, Any]:
@@ -135,6 +227,52 @@ def _resolve_hitl_refinement_context(config: RunnableConfig | None) -> str | Non
     return None
 
 
+def _contains_genre_or_theme_term(normalized: str) -> bool:
+    if not normalized:
+        return False
+    for term in GENRE_THEME_TERMS:
+        if re.search(rf"\b{re.escape(term)}\b", normalized):
+            return True
+    return False
+
+
+def _looks_like_theme_recommendation_prompt(normalized: str) -> bool:
+    if not normalized:
+        return False
+
+    if not _contains_genre_or_theme_term(normalized):
+        return False
+
+    explicit_preference_markers = (
+        "i like ",
+        "i love ",
+        "i prefer ",
+        "i enjoy ",
+        "i'm into ",
+        "im into ",
+        "looking for ",
+        "in the mood for ",
+        "give me ",
+        "show me some ",
+        "want some ",
+    )
+    broad_theme_markers = (
+        " and ",
+        " or ",
+        "more ",
+        "less ",
+        "without ",
+        "with more ",
+        "with less ",
+    )
+
+    return (
+        normalized.startswith(explicit_preference_markers)
+        or any(marker in normalized for marker in broad_theme_markers)
+        or len(normalized.split()) <= 5
+    )
+
+
 def _classify_intent_fast_path(user_text: str) -> tuple[str, dict[str, Any]] | None:
     normalized = " ".join(user_text.lower().strip().split())
     if not normalized:
@@ -149,17 +287,11 @@ def _classify_intent_fast_path(user_text: str) -> tuple[str, dict[str, Any]] | N
     )
     similarity_markers = ("similar to", "like ", "items like", "more like")
     lookup_markers = ("find ", "search ", "look up", "show me", "who is", "what is")
-    preference_statement_prefixes = (
-        "i like ",
-        "i love ",
-        "i prefer ",
-        "i enjoy ",
-        "my favorite",
-        "my favourite",
-        "i don't like ",
-        "i do not like ",
-        "i hate ",
-    )
+    if looks_like_project_context_question(user_text):
+        return (
+            "general_qa",
+            {"item_query": "", "needs_weather_tool": False, "reason": "heuristic_project_context"},
+        )
 
     if any(marker in normalized for marker in recommendation_markers):
         return (
@@ -167,7 +299,13 @@ def _classify_intent_fast_path(user_text: str) -> tuple[str, dict[str, Any]] | N
             {"item_query": "", "needs_weather_tool": False, "reason": "heuristic_recommendation"},
         )
 
-    if normalized.startswith(preference_statement_prefixes):
+    if _looks_like_theme_recommendation_prompt(normalized):
+        return (
+            "user_recommendation",
+            {"item_query": "", "needs_weather_tool": False, "reason": "heuristic_theme_recommendation"},
+        )
+
+    if normalized.startswith(PREFERENCE_STATEMENT_PREFIXES):
         return (
             "general_qa",
             {"item_query": "", "needs_weather_tool": False, "reason": "heuristic_preference_statement"},
@@ -212,6 +350,8 @@ def _timed_span(trace_id: str, stage: str, **kwargs: object):
 def _get_instructor_client():
     if instructor is None or OpenAI is None:
         raise RuntimeError("instructor/openai dependencies are not available")
+    if _backend_llm_provider() != "ollama":
+        raise RuntimeError("instructor fast-path is only configured for the Ollama backend")
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
     api_key = os.getenv("OLLAMA_API_KEY", "ollama")
     openai_client = OpenAI(base_url=base_url, api_key=api_key)
@@ -219,7 +359,7 @@ def _get_instructor_client():
 
 
 def _classify_intent_with_instructor(user_text: str) -> IntentClassification:
-    model_name = os.getenv("OLLAMA_MODEL", "llama3.2")
+    model_name = settings.backend_ollama_model
     client = _get_instructor_client()
     return client.chat.completions.create(
         model=model_name,
@@ -236,13 +376,15 @@ def _classify_intent_with_instructor(user_text: str) -> IntentClassification:
             {
                 "role": "user",
                 "content": (
-                    "Classify the latest user message.\n"
-                    "Valid intents: user_recommendation, entity_lookup, item_similarity, general_qa.\n"
-                    "For attributes.item_query extract only the core entity/title when relevant.\n"
-                    "Set attributes.needs_weather_tool=true only if weather is explicitly requested.\n"
-                    f"Message: {user_text}"
-                ),
-            },
+                "Classify the latest user message.\n"
+                "Valid intents: user_recommendation, entity_lookup, item_similarity, general_qa.\n"
+                "If the user expresses genres, themes, moods, or broad preferences without a concrete title/entity, classify as user_recommendation.\n"
+                "Use entity_lookup or item_similarity only when the message refers to a specific title, item, artist, product, or place.\n"
+                "For attributes.item_query extract only the core entity/title when relevant.\n"
+                "Set attributes.needs_weather_tool=true only if weather is explicitly requested.\n"
+                f"Message: {user_text}"
+            ),
+        },
         ],
     )
 
@@ -286,8 +428,65 @@ def _validate_classifier_payload(payload: Any) -> tuple[str, dict[str, Any]]:
     if not isinstance(payload, dict):
         return default.intent, default.attributes.model_dump()
 
+    def _coerce_classifier_intent(value: Any) -> str:
+        if not isinstance(value, str):
+            return default.intent
+        normalized = re.sub(r"[\s\-]+", "_", value.strip().lower())
+        normalized = re.sub(r"[^a-z_]", "", normalized)
+        if normalized in VALID_INTENTS:
+            return normalized
+        return INTENT_ALIASES.get(normalized, default.intent)
+
+    def _coerce_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "y", "weather", "required"}:
+                return True
+            if normalized in {"false", "0", "no", "n", "", "none", "null"}:
+                return False
+        return default.attributes.needs_weather_tool
+
+    def _clean_model_string(value: Any, *, fallback: str = "", max_len: int = 500) -> str:
+        if value is None:
+            return fallback
+        if isinstance(value, (dict, list, tuple, set)):
+            return fallback
+        cleaned = " ".join(str(value).strip().split())
+        if cleaned.lower() in {"none", "null", "n/a", "na", "unknown"}:
+            return fallback
+        return cleaned[:max_len]
+
+    raw_attributes = payload.get("attributes")
+    attrs = raw_attributes if isinstance(raw_attributes, dict) else {}
+    item_query = _clean_model_string(
+        attrs.get("item_query", payload.get("item_query")),
+        fallback="",
+        max_len=300,
+    )
+    reason = _clean_model_string(
+        attrs.get("reason", payload.get("reason")),
+        fallback=default.attributes.reason,
+        max_len=120,
+    ) or default.attributes.reason
+    needs_weather_tool = _coerce_bool(
+        attrs.get("needs_weather_tool", payload.get("needs_weather_tool", default.attributes.needs_weather_tool))
+    )
+
+    normalized_payload = {
+        "intent": _coerce_classifier_intent(payload.get("intent")),
+        "attributes": {
+            "item_query": item_query,
+            "needs_weather_tool": needs_weather_tool,
+            "reason": reason,
+        },
+    }
+
     try:
-        parsed = IntentClassification.model_validate(payload)
+        parsed = IntentClassification.model_validate(normalized_payload)
     except Exception:
         return default.intent, default.attributes.model_dump()
     return parsed.intent, parsed.attributes.model_dump()
@@ -300,8 +499,268 @@ def _safe_item_query_from_attributes(attrs: dict[str, Any], fallback_prompt: str
     return fallback_prompt.strip()
 
 
+def _clean_entity_lookup_query(query: str) -> str:
+    cleaned = " ".join(str(query or "").strip().split())
+    if not cleaned:
+        return ""
+
+    patterns = (
+        r"^(find|search)\s+",
+        r"^(look up)\s+",
+        r"^(show me)\s+",
+        r"^(who is)\s+",
+        r"^(what is)\s+",
+    )
+    for pattern in patterns:
+        cleaned = __import__("re").sub(pattern, "", cleaned, flags=__import__("re").IGNORECASE)
+        cleaned = cleaned.strip(" .?!\"'")
+    return cleaned.strip()
+
+
+def _sanitize_intent_classification(
+    user_text: str,
+    intent: str,
+    attributes: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    normalized = " ".join((user_text or "").lower().strip().split())
+    attrs = dict(attributes or {})
+    item_query = str(attrs.get("item_query") or "").strip()
+
+    if looks_like_project_context_question(user_text):
+        return (
+            "general_qa",
+            {
+                "item_query": "",
+                "needs_weather_tool": False,
+                "reason": "sanitized_project_context_question",
+            },
+        )
+
+    if intent in {"entity_lookup", "item_similarity"}:
+        cleaned_query = _clean_entity_lookup_query(item_query or user_text)
+        cleaned_normalized = " ".join(cleaned_query.lower().split())
+
+        if _looks_like_theme_recommendation_prompt(normalized) and _contains_genre_or_theme_term(
+            cleaned_normalized
+        ):
+            return (
+                "user_recommendation",
+                {
+                    "item_query": "",
+                    "needs_weather_tool": bool(attrs.get("needs_weather_tool", False)),
+                    "reason": "sanitized_theme_recommendation",
+                },
+            )
+
+        if intent == "entity_lookup":
+            attrs["item_query"] = cleaned_query
+        elif not item_query and cleaned_query:
+            attrs["item_query"] = cleaned_query
+
+    return intent, attrs
+
+
+def _message_type(message: Any) -> str:
+    if isinstance(message, dict):
+        return str(message.get("role") or message.get("type") or "").strip().lower()
+    return str(getattr(message, "type", "") or "").strip().lower()
+
+
+def _collect_recommendation_supporting_context(
+    messages: list[Any],
+    *,
+    include_refinement_context: bool,
+) -> list[str]:
+    contexts: list[str] = []
+    preference_hints: list[str] = []
+
+    for message in messages[:-1]:
+        msg_type = _message_type(message)
+        text = _content_to_text(message.get("content", "")) if isinstance(message, dict) else _content_to_text(getattr(message, "content", ""))
+        if not text:
+            continue
+
+        normalized = " ".join(text.lower().strip().split())
+        if msg_type in {"system"}:
+            if text.startswith("Persistent user memory facts."):
+                contexts.append(text.strip())
+                continue
+            if text.startswith("Recommendation follow-up context for this thread:"):
+                contexts.append(text.strip())
+                continue
+            if include_refinement_context and text.startswith("Human-in-the-loop refinement context for this thread:"):
+                contexts.append(text.strip())
+                continue
+
+        if msg_type in {"human", "user"} and (
+            normalized.startswith(PREFERENCE_STATEMENT_PREFIXES)
+            or _looks_like_theme_recommendation_prompt(normalized)
+        ):
+            preference_hints.append(text.strip())
+
+    if preference_hints:
+        contexts.insert(
+            0,
+            "Previous user preference hints:\n" + "\n".join(f"- {hint}" for hint in preference_hints[-3:]),
+        )
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for context in contexts:
+        key = context.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(key)
+    return deduped
+
+
+def _extract_previous_recommendation_titles(messages: list[Any]) -> list[str]:
+    for message in messages:
+        if _message_type(message) != "system":
+            continue
+        text = _content_to_text(message.get("content", "")) if isinstance(message, dict) else _content_to_text(getattr(message, "content", ""))
+        match = re.search(r"Top recommended items:\s*(.+?)(?:\.|$)", text)
+        if not match:
+            continue
+        titles = [part.strip() for part in match.group(1).split(";") if part.strip()]
+        if titles:
+            return titles
+    return []
+
+
+def _extract_context_line(messages: list[Any], label: str) -> str:
+    pattern = re.compile(rf"{re.escape(label)}\s*(.+)")
+    for message in messages:
+        if _message_type(message) != "system":
+            continue
+        text = _content_to_text(message.get("content", "")) if isinstance(message, dict) else _content_to_text(getattr(message, "content", ""))
+        for line in text.splitlines():
+            match = pattern.search(line.strip())
+            if match:
+                return match.group(1).strip()
+    return ""
+
+
+def _build_deterministic_recommendation_follow_up_answer(messages: list[Any], last_content: str) -> str | None:
+    normalized = " ".join((last_content or "").lower().strip().split())
+    if not normalized:
+        return None
+
+    titles = _extract_previous_recommendation_titles(messages)
+    previous_request = _extract_context_line(messages, "Previous recommendation request:")
+    feedback_note = _extract_context_line(messages, "Latest user feedback note:")
+    if not feedback_note:
+        feedback_note = _extract_context_line(messages, "Stored feedback note:")
+
+    if not any([titles, previous_request, feedback_note]):
+        return None
+
+    starter_markers = (
+        "which one should i start with",
+        "which one should i start",
+        "start with",
+        "which one",
+        "best one",
+        "first one",
+        "pick one",
+    )
+    why_markers = (
+        "why these",
+        "why this list",
+        "explain these",
+        "explain this list",
+        "why did you recommend",
+    )
+
+    if any(marker in normalized for marker in starter_markers) and titles:
+        top_title = titles[0]
+        return (
+            f"Start with {top_title} first. "
+            "It is the safest entry point from the previous recommendation list because it was surfaced at the top of that set."
+        )
+
+    if any(marker in normalized for marker in why_markers):
+        parts: list[str] = []
+        if previous_request:
+            parts.append(f"These recommendations are anchored to your earlier request: {previous_request}.")
+        else:
+            parts.append("These recommendations are anchored to your previous recommendation context.")
+        if feedback_note:
+            parts.append(f"I also kept your latest feedback note in mind: {feedback_note}.")
+        if titles:
+            parts.append(f"The previous list was headed by {titles[0]}.")
+        parts.append("If you want, I can now compare the top items one by one.")
+        return " ".join(parts)
+
+    return None
+
+
+def _is_recommendation_follow_up_question(messages: list[Any], last_content: str) -> bool:
+    return _build_deterministic_recommendation_follow_up_answer(messages, last_content) is not None
+
+
+def _extract_feedback_note(refinement_context: str | None) -> str:
+    if not refinement_context:
+        return ""
+    match = re.search(r"Stored feedback note:\s*(.+)", refinement_context)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def _is_generic_retry_prompt(prompt: str) -> bool:
+    normalized = " ".join((prompt or "").lower().strip().split())
+    if not normalized:
+        return False
+    generic_markers = (
+        "another try",
+        "try again",
+        "retry",
+        "another one",
+        "something else",
+        "different options",
+        "different recommendations",
+        "not these",
+        "give me another",
+        "start over",
+    )
+    return any(marker in normalized for marker in generic_markers)
+
+
+def _build_effective_recommendation_prompt(last_prompt: str, refinement_context: str | None) -> str:
+    if not refinement_context:
+        return last_prompt
+
+    current_request = last_prompt.strip()
+    feedback_note = _extract_feedback_note(refinement_context)
+    if feedback_note and _is_generic_retry_prompt(current_request):
+        current_request = (
+            f"{current_request}\n"
+            f"Use this stored feedback to steer the reranking: {feedback_note}"
+        )
+
+    return f"{refinement_context}\n\nCurrent refinement request:\n{current_request}"
+
+
+def _response_latency_payload(remote_ms: float, response_json: dict[str, Any]) -> dict[str, float]:
+    service_latency = response_json.get("latency") if isinstance(response_json, dict) else None
+    recommender_total_ms = None
+    if isinstance(service_latency, dict):
+        maybe_total = service_latency.get("recommender_total_ms")
+        if isinstance(maybe_total, (int, float)):
+            recommender_total_ms = round(float(maybe_total), 2)
+
+    payload: dict[str, float] = {
+        "backend_to_recommender_http_ms": round(float(remote_ms), 2),
+    }
+    if recommender_total_ms is not None:
+        payload["recommender_total_ms"] = recommender_total_ms
+    return payload
+
+
 def _extract_item_query_with_llm(user_prompt: str, instruction: str) -> str:
-    llm = ChatOllama(model="llama3.2", temperature=0)
+    llm = _build_backend_chat_llm(temperature=0)
     system_prompt = SystemMessage(content=instruction)
     human_prompt = HumanMessage(content=user_prompt)
     return str(llm.invoke([system_prompt, human_prompt]).content).strip()
@@ -383,9 +842,46 @@ def classifier_node(state: AgentState, config: RunnableConfig) -> dict:
                 "attributes": attributes,
             }
 
+        if _is_recommendation_follow_up_question(messages, user_text):
+            attributes = {
+                "item_query": "",
+                "needs_weather_tool": False,
+                "reason": "recommendation_follow_up_question",
+            }
+            log.info(
+                "[CLASSIFIER] trace_id=%r via=recommendation_follow_up intent=%r attributes=%s",
+                trace_id,
+                "general_qa",
+                attributes,
+            )
+            return {
+                "trace_id": trace_id,
+                "intent": "general_qa",
+                "attributes": attributes,
+            }
+
+        if looks_like_project_context_question(user_text):
+            attributes = {
+                "item_query": "",
+                "needs_weather_tool": False,
+                "reason": "project_context_question",
+            }
+            log.info(
+                "[CLASSIFIER] trace_id=%r via=project_context intent=%r attributes=%s",
+                trace_id,
+                "general_qa",
+                attributes,
+            )
+            return {
+                "trace_id": trace_id,
+                "intent": "general_qa",
+                "attributes": attributes,
+            }
+
         heuristic = _classify_intent_fast_path(user_text)
         if heuristic is not None:
             intent, attributes = heuristic
+            intent, attributes = _sanitize_intent_classification(user_text, intent, attributes)
             log.info(
                 "[CLASSIFIER] trace_id=%r via=heuristic intent=%r attributes=%s",
                 trace_id,
@@ -398,6 +894,7 @@ def classifier_node(state: AgentState, config: RunnableConfig) -> dict:
             parsed = _classify_intent_with_instructor(user_text)
             intent = parsed.intent
             attributes = parsed.attributes.model_dump()
+            intent, attributes = _sanitize_intent_classification(user_text, intent, attributes)
             log.info(
                 "[CLASSIFIER] trace_id=%r via=instructor intent=%r attributes=%s",
                 trace_id,
@@ -407,38 +904,41 @@ def classifier_node(state: AgentState, config: RunnableConfig) -> dict:
             return {"trace_id": trace_id, "intent": intent, "attributes": attributes}
         except Exception as instructor_exc:
             log.warning(
-                "[CLASSIFIER] trace_id=%r instructor classification failed, fallback to Ollama parsing: %s",
+                "[CLASSIFIER] trace_id=%r instructor classification failed, fallback to direct LLM parsing: %s",
                 trace_id,
                 instructor_exc,
             )
 
-            llm = ChatOllama(model=os.getenv("OLLAMA_MODEL", "llama3.2"), temperature=0)
-            prompt = [
-                SystemMessage(
-                    content=(
-                        "You are a workflow router for a recommender chatbot. "
-                        "Classify the latest user message and extract attributes. "
-                        "Return ONLY valid JSON with this schema:\n"
-                        "{\n"
-                        '  "intent": "user_recommendation|entity_lookup|item_similarity|general_qa",\n'
-                        '  "attributes": {\n'
-                        '    "item_query": "string or empty",\n'
-                        '    "needs_weather_tool": true|false,\n'
-                        '    "reason": "short explanation"\n'
-                        "  }\n"
-                        "}"
-                    )
-                ),
-                HumanMessage(content=user_text),
-            ]
-
             try:
+                llm = _build_backend_chat_llm(temperature=0)
+                prompt = [
+                    SystemMessage(
+                        content=(
+                            "You are a workflow router for a recommender chatbot. "
+                            "Classify the latest user message and extract attributes. "
+                            "If the user mentions only genres, themes, moods, or broad preferences without a concrete title/entity, use user_recommendation. "
+                            "Use entity_lookup or item_similarity only for specific entities/titles. "
+                            "Return ONLY valid JSON with this schema:\n"
+                            "{\n"
+                            '  "intent": "user_recommendation|entity_lookup|item_similarity|general_qa",\n'
+                            '  "attributes": {\n'
+                            '    "item_query": "string or empty",\n'
+                            '    "needs_weather_tool": true|false,\n'
+                            '    "reason": "short explanation"\n'
+                            "  }\n"
+                            "}"
+                        )
+                    ),
+                    HumanMessage(content=user_text),
+                ]
                 raw = llm.invoke(prompt).content
                 parsed_dict = _parse_json_from_model_output(raw)
                 intent, attributes = _validate_classifier_payload(parsed_dict)
+                intent, attributes = _sanitize_intent_classification(user_text, intent, attributes)
                 log.info(
-                    "[CLASSIFIER] trace_id=%r via=ollama intent=%r attributes=%s",
+                    "[CLASSIFIER] trace_id=%r via=%s intent=%r attributes=%s",
                     trace_id,
+                    _backend_llm_provider(),
                     intent,
                     attributes,
                 )
@@ -466,12 +966,17 @@ def user_recommendation_node(state: AgentState, config: RunnableConfig) -> dict:
     user_id = _resolve_user_id(config)
     dataset_user_id = _resolve_dataset_user_id(config)
     refinement_context = _resolve_hitl_refinement_context(config)
-    last_prompt = _content_to_text(state["messages"][-1].content) if state.get("messages") else ""
-    effective_prompt = (
-        f"{refinement_context}\n\nCurrent refinement request:\n{last_prompt}"
-        if refinement_context
-        else last_prompt
+    messages = state.get("messages", [])
+    last_prompt = _content_to_text(messages[-1].content) if messages else ""
+    effective_prompt = _build_effective_recommendation_prompt(last_prompt, refinement_context)
+    supporting_contexts = _collect_recommendation_supporting_context(
+        messages,
+        include_refinement_context=not bool(refinement_context),
     )
+    if supporting_contexts:
+        effective_prompt = "\n\n".join(
+            supporting_contexts + [f"Current recommendation request:\n{effective_prompt.strip()}"]
+        )
 
     with _timed_span(
         trace_id,
@@ -501,7 +1006,12 @@ def user_recommendation_node(state: AgentState, config: RunnableConfig) -> dict:
 
             remote_start = time.perf_counter()
             recommendation_timeout = 90 if rec_model == "llm_rag" else 45
-            resp = http_requests.post(url, json=payload_dict, timeout=recommendation_timeout)
+            resp = http_requests.post(
+                url,
+                json=payload_dict,
+                timeout=recommendation_timeout,
+                headers={"X-Trace-Id": trace_id},
+            )
             remote_ms = round((time.perf_counter() - remote_start) * 1000, 2)
             resp.raise_for_status()
 
@@ -548,6 +1058,7 @@ def user_recommendation_node(state: AgentState, config: RunnableConfig) -> dict:
                     "cold_start": cold_start,
                     "trace_id": trace_id,
                     "explanation": explanation,
+                    "latency": _response_latency_payload(remote_ms, data),
                     "follow_up_prompts": build_follow_up_prompts(
                         items=items,
                         cold_start=bool(cold_start),
@@ -598,6 +1109,7 @@ def entity_lookup_node(state: AgentState, config: RunnableConfig) -> dict:
                 "No quotes, no extra words, no commentary."
             ),
         )
+    extracted_query = _clean_entity_lookup_query(extracted_query or last_prompt)
 
     with _timed_span(trace_id, "backend.entity_lookup", dataset=dataset, query=extracted_query):
         try:
@@ -613,6 +1125,7 @@ def entity_lookup_node(state: AgentState, config: RunnableConfig) -> dict:
                 target_url,
                 params=request_params,
                 timeout=45,
+                headers={"X-Trace-Id": trace_id},
             )
             remote_ms = round((time.perf_counter() - remote_start) * 1000, 2)
             resp.raise_for_status()
@@ -639,14 +1152,9 @@ def entity_lookup_node(state: AgentState, config: RunnableConfig) -> dict:
                     ],
                 }
 
-            items_list = "\n".join(
-                f"{i + 1}. {item['title']}" + (f" ({item['genres']})" if item.get("genres") else "")
-                for i, item in enumerate(results)
-            )
             content = (
                 f"I found {len(results)} matching items for '{extracted_query}' in `{dataset}`. "
-                "The best matches are shown below as cards.\n\n"
-                f"Quick list:\n{items_list}"
+                "The best matches are shown below as cards."
             )
             return {
                 "trace_id": trace_id,
@@ -658,6 +1166,7 @@ def entity_lookup_node(state: AgentState, config: RunnableConfig) -> dict:
                     "dataset": dataset,
                     "query": extracted_query,
                     "trace_id": trace_id,
+                    "latency": _response_latency_payload(remote_ms, data),
                 },
                 "messages": [AIMessage(content=content)],
             }
@@ -722,6 +1231,7 @@ def item_similarity_node(state: AgentState, config: RunnableConfig) -> dict:
                 f"{RECOMMENDER_BASE_URL}{endpoint}",
                 json=request_payload,
                 timeout=45,
+                headers={"X-Trace-Id": trace_id},
             )
             remote_ms = round((time.perf_counter() - remote_start) * 1000, 2)
             resp.raise_for_status()
@@ -758,6 +1268,7 @@ def item_similarity_node(state: AgentState, config: RunnableConfig) -> dict:
                     "rec_model": data.get("model", rec_model),
                     "seed_title": seed_title,
                     "trace_id": trace_id,
+                    "latency": _response_latency_payload(remote_ms, data),
                 },
                 "messages": [AIMessage(content=content)],
             }
@@ -816,37 +1327,58 @@ def general_qa_node(state: AgentState, config: RunnableConfig) -> dict:
         if getattr(last_message, "type", "") == "human" and last_content.lower().strip() in greetings:
             return {"trace_id": trace_id, "messages": [AIMessage(content="Hello! How can I help you today?")]}
 
-        if was_tool:
-            llm = ChatOllama(model=os.getenv("OLLAMA_MODEL", "llama3.2"), temperature=0)
-            tool_content = _content_to_text(messages[-1].content)
-            system_prompt = SystemMessage(
-                content=(
-                    "You are a helpful assistant. You just received a tool result. "
-                    "Summarize it clearly and briefly in English."
-                )
-            )
-            messages_for_llm = [system_prompt] + messages
-            messages_for_llm.append(
-                HumanMessage(content=f"Tool result: '{tool_content}'. Provide a concise user-facing answer.")
-            )
-        else:
-            llm = ChatOllama(model=os.getenv("OLLAMA_MODEL", "llama3.2"), temperature=0)
-            if needs_weather_tool:
-                log.info("[GENERAL_QA] trace_id=%r enabling weather tool", trace_id)
-                llm = llm.bind_tools([get_weather])
-            system_prompt = SystemMessage(
-                content=(
-                    "You are a recommender assistant.\n"
-                    "Rules:\n"
-                    "1. Use the weather tool only when weather information is explicitly requested.\n"
-                    "2. For all other requests, answer directly in plain text.\n"
-                    "3. Do not invent tool outputs.\n"
-                    "4. Do not output JSON unless the user explicitly asks for JSON."
-                )
-            )
-            messages_for_llm = [system_prompt] + messages
+        if (
+            getattr(last_message, "type", "") == "human"
+            and not was_tool
+            and not needs_weather_tool
+            and looks_like_project_context_question(last_content)
+        ):
+            try:
+                mcp_start = time.perf_counter()
+                answer = fetch_project_context_sync(last_content)
+                mcp_ms = round((time.perf_counter() - mcp_start) * 1000, 2)
+                log.info("[GENERAL_QA] trace_id=%r answered via benchmark_mcp in %sms", trace_id, mcp_ms)
+                if answer:
+                    return {"trace_id": trace_id, "messages": [AIMessage(content=answer)]}
+            except Exception as exc:
+                log.warning("[GENERAL_QA] trace_id=%r benchmark_mcp fallback failed: %s", trace_id, exc)
 
         try:
+            deterministic_follow_up = None
+            if getattr(last_message, "type", "") == "human" and not was_tool and not needs_weather_tool:
+                deterministic_follow_up = _build_deterministic_recommendation_follow_up_answer(messages, last_content)
+            if deterministic_follow_up:
+                return {"trace_id": trace_id, "messages": [AIMessage(content=deterministic_follow_up)]}
+
+            if was_tool:
+                llm = _build_backend_chat_llm(temperature=0)
+                tool_content = _content_to_text(messages[-1].content)
+                system_prompt = SystemMessage(
+                    content=(
+                        "You are a helpful assistant. You just received a tool result. "
+                        "Summarize it clearly and briefly in English."
+                    )
+                )
+                messages_for_llm = [system_prompt] + messages
+                messages_for_llm.append(
+                    HumanMessage(content=f"Tool result: '{tool_content}'. Provide a concise user-facing answer.")
+                )
+            else:
+                llm = _build_backend_chat_llm(temperature=0, tools=[get_weather] if needs_weather_tool else None)
+                if needs_weather_tool:
+                    log.info("[GENERAL_QA] trace_id=%r enabling weather tool via provider=%r", trace_id, _backend_llm_provider())
+                system_prompt = SystemMessage(
+                    content=(
+                        "You are a recommender assistant.\n"
+                        "Rules:\n"
+                        "1. Use the weather tool only when weather information is explicitly requested.\n"
+                        "2. For all other requests, answer directly in plain text.\n"
+                        "3. Do not invent tool outputs.\n"
+                        "4. Do not output JSON unless the user explicitly asks for JSON."
+                    )
+                )
+                messages_for_llm = [system_prompt] + messages
+
             llm_start = time.perf_counter()
             response = llm.invoke(messages_for_llm)
             llm_ms = round((time.perf_counter() - llm_start) * 1000, 2)
@@ -854,9 +1386,10 @@ def general_qa_node(state: AgentState, config: RunnableConfig) -> dict:
             return {"trace_id": trace_id, "messages": [response]}
         except Exception as exc:
             content = (
-                f"[MOCK - INTENT: general_qa]\n"
-                f"General conversation. User said: '{last_content}'\n\n"
-                f"(Ollama may be unavailable. Error: {exc})"
+                "I couldn't use the conversational LLM runtime for this message right now. "
+                "Recommendation, search, similarity, and project-capability questions are still available.\n\n"
+                f"Original request: {last_content}\n"
+                f"Technical detail: {exc}"
             )
             return {"trace_id": trace_id, "messages": [AIMessage(content=content)]}
 

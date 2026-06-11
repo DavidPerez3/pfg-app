@@ -3,9 +3,11 @@ uvicorn
 pydantic
 sqlalchemy
 psycopg[binary]
+mcp
 langgraph
 langchain
 langchain-core
+langchain-google-genai
 langchain-ollama
 python-dotenv
 langgraph-checkpoint-sqlite

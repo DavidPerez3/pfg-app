@@ -5,8 +5,8 @@ import { NuqsAdapter } from "nuqs/adapters/next/app";
 import { SessionProvider } from "next-auth/react";
 
 export const metadata: Metadata = {
-  title: "PFG – Recommender AI",
-  description: "Sistema de Recomendación con IA y LangGraph",
+  title: "PFG - Recommender AI",
+  description: "Sistema de recomendacion conversacional con IA",
 };
 
 export default function RootLayout({

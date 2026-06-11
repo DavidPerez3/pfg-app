@@ -1,0 +1,37 @@
+# Python
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local env and runtime state
+backend/.env
+backend/.env.*
+backend/*.db
+recommender/.env
+recommender/.env.*
+
+# Logs
+*.log
+backend/*.log
+recommender/*.log
+
+# Local benchmark and browser artifacts
+benchmark_results/
+frontend/test-results/
+frontend/playwright-report/
+
+# Node / frontend build outputs
+frontend/node_modules/
+frontend/apps/web/node_modules/
+frontend/apps/web/.next/
+frontend/apps/web/.turbo/
+frontend/apps/agents/node_modules/
+frontend/apps/agents/dist/
+frontend/apps/agents/.turbo/
+
+# Misc local files
+.DS_Store

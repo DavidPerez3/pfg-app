@@ -50,6 +50,7 @@ if str(APP_ROOT) not in sys.path:
 from shared.contracts import (  # noqa: E402
     DatasetUserOption,
     DatasetUsersResponse,
+    LatencyTelemetry,
     RecommendRequest,
     RecommendResponse,
     RecommendedItem,
@@ -80,6 +81,29 @@ MODEL_KEY_TO_LABEL = {
     "llm_rag": "LLM + RAG",
 }
 
+
+def _normalize_model_key(rec_model: str | None) -> str | None:
+    raw = str(rec_model or "").strip().lower()
+    if not raw:
+        return None
+    underscored = raw.replace("-", "_")
+    if underscored in MODEL_KEY_TO_LABEL:
+        return underscored
+    return MODEL_SLUG_TO_KEY.get(raw)
+
+
+def _raise_unsupported_dataset(dataset: str) -> None:
+    raise HTTPException(400, f"Unsupported dataset: {dataset}")
+
+
+def _run_not_trained_detail(model_key: str, dataset: str) -> str:
+    label = MODEL_KEY_TO_LABEL.get(model_key, model_key)
+    return f"Run not trained: {label} is not available for dataset '{dataset}'."
+
+
+def _raise_run_not_trained(model_key: str, dataset: str) -> None:
+    raise HTTPException(404, _run_not_trained_detail(model_key, dataset))
+
 GENRE_ALIASES = {
     "comedy": ["comedy", "comedies", "funny", "humor"],
     "drama": ["drama", "dramatic"],
@@ -97,6 +121,52 @@ GENRE_ALIASES = {
     "western": ["western"],
     "war": ["war"],
 }
+
+SEARCH_SOURCE_FIELDS = [
+    "item_id",
+    "text_repr",
+    "title",
+    "item_name",
+    "genres",
+    "artist",
+    "track",
+    "categories",
+    "category",
+    "city",
+    "state",
+    "country",
+    "brand",
+    "description",
+    "feature_text",
+    "sample_summary",
+    "summary_mode",
+    "summary_examples",
+    "sample_review_excerpt",
+    "top_style",
+    "temporal_profile",
+]
+
+SEARCH_TEXT_FIELDS = [
+    "title^8",
+    "item_name^7",
+    "text_repr^6",
+    "artist^5",
+    "track^5",
+    "brand^4",
+    "categories^4",
+    "category^4",
+    "city^3",
+    "state^2",
+    "country^2",
+    "top_style^3",
+    "sample_summary^2",
+    "summary_mode^2",
+    "summary_examples^2",
+    "sample_review_excerpt^2",
+    "description^2",
+    "feature_text^2",
+    "temporal_profile^2",
+]
 
 
 def _resolve_model_key(model_slug: str) -> str:
@@ -117,6 +187,10 @@ def _timed_span(trace_id: str | None, stage: str, **kwargs: object):
     finally:
         elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
         log.info("[TRACE][END] trace_id=%r stage=%r elapsed_ms=%s", trace_id, stage, elapsed_ms)
+
+
+def _latency_telemetry(start: float) -> LatencyTelemetry:
+    return LatencyTelemetry(recommender_total_ms=round((time.perf_counter() - start) * 1000, 2))
 
 
 
@@ -322,6 +396,49 @@ def _dataset_user_options(dataset: str) -> tuple[list[DatasetUserOption], int]:
     return options, len(options)
 
 
+@lru_cache(maxsize=8)
+def _mf_trained_dataset_user_ids(dataset: str) -> frozenset[str] | None:
+    user_factors_path = MODELS_ROOT / "matrix_factorization" / dataset / "user_factors.npy"
+    if not user_factors_path.exists():
+        return None
+
+    user_factors = _load_npy(str(user_factors_path))
+    trained_user_capacity = int(len(user_factors))
+    if trained_user_capacity <= 0:
+        return frozenset()
+
+    dataset_user_map = _dataset_user_index_map(dataset)
+    trained_user_ids = frozenset(
+        user_id
+        for user_id, user_idx in dataset_user_map.items()
+        if user_idx < trained_user_capacity
+    )
+    if trained_user_capacity < len(dataset_user_map):
+        log.warning(
+            "[DATASET_USERS] dataset=%r MF user_factors cover %s/%s dataset users; filtering selector options to the aligned subset",
+            dataset,
+            trained_user_capacity,
+            len(dataset_user_map),
+        )
+    return trained_user_ids
+
+
+def _dataset_user_options_for_model(
+    dataset: str,
+    rec_model: str | None = None,
+) -> tuple[list[DatasetUserOption], int]:
+    options, total_available = _dataset_user_options(dataset)
+    if _normalize_model_key(rec_model) != "matrix_factorization":
+        return options, total_available
+
+    trained_user_ids = _mf_trained_dataset_user_ids(dataset)
+    if trained_user_ids is None:
+        return options, total_available
+
+    filtered = [option for option in options if option.user_id in trained_user_ids]
+    return filtered, len(filtered)
+
+
 def _clip_valid_indices(indices: set[int] | list[int], upper_bound: int) -> list[int]:
     return sorted({idx for idx in indices if 0 <= idx < upper_bound})
 
@@ -415,6 +532,23 @@ def _filter_item_ids_by_genres(
     return filtered
 
 
+def _apply_genre_constraints_to_item_ids(
+    dataset: str,
+    candidate_item_ids: list[str],
+    include_genres: set[str],
+    exclude_genres: set[str],
+    top_k: int,
+) -> list[str]:
+    # Negative constraints are strict. If the user says "without romance", we
+    # should keep romance items out even when the candidate pool shrinks.
+    filtered = _filter_item_ids_by_genres(dataset, candidate_item_ids, set(), exclude_genres)
+    if include_genres:
+        include_only = _filter_item_ids_by_genres(dataset, filtered, include_genres, set())
+        if len(include_only) >= top_k:
+            return include_only
+    return filtered
+
+
 def _rerank_item_ids_by_prompt(dataset: str, candidate_item_ids: list[str], prompt: str, top_k: int) -> list[str]:
     tokens = _prompt_tokens(prompt)
     include_genres, exclude_genres = _genre_constraints_from_prompt(prompt)
@@ -495,6 +629,226 @@ def _normalize_text(text: str) -> str:
     return text.lower()
 
 
+def _normalize_lookup_query_text(text: str) -> str:
+    normalized = _normalize_text(text)
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return " ".join(normalized.split()).strip()
+
+
+def _search_query_variants(query: str) -> list[str]:
+    raw = " ".join(str(query or "").strip().split())
+    if not raw:
+        return []
+
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def _push(value: str) -> None:
+        cleaned = " ".join(str(value or "").strip().split())
+        if not cleaned:
+            return
+        key = cleaned.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        variants.append(cleaned)
+
+    _push(raw)
+
+    normalized = _normalize_lookup_query_text(raw)
+    if normalized and normalized.lower() != raw.lower():
+        _push(normalized)
+
+    for separator in (" - ", " by ", ", "):
+        if separator in raw.lower():
+            parts = [part.strip() for part in re.split(re.escape(separator), raw, flags=re.IGNORECASE)]
+            for part in parts:
+                _push(part)
+            if len(parts) >= 2:
+                _push(" ".join(part for part in parts if part))
+            break
+
+    return variants
+
+
+def _search_artist_track_parts(query: str) -> tuple[str, str] | None:
+    compact = " ".join(str(query or "").strip().split())
+    if not compact:
+        return None
+
+    hyphen_parts = [part.strip() for part in compact.split(" - ", 1)]
+    if len(hyphen_parts) == 2 and all(hyphen_parts):
+        return hyphen_parts[0], hyphen_parts[1]
+
+    by_match = re.match(r"(.+?)\s+by\s+(.+)", compact, flags=re.IGNORECASE)
+    if by_match:
+        track = by_match.group(1).strip()
+        artist = by_match.group(2).strip()
+        if artist and track:
+            return artist, track
+
+    return None
+
+
+def _build_elasticsearch_lookup_should_clauses(query: str) -> list[dict[str, object]]:
+    should_clauses: list[dict[str, object]] = [
+        {"term": {"item_id": {"value": query, "boost": 12.0}}},
+    ]
+
+    for variant in _search_query_variants(query):
+        should_clauses.append(
+            {
+                "multi_match": {
+                    "query": variant,
+                    "fields": SEARCH_TEXT_FIELDS,
+                    "type": "best_fields",
+                    "fuzziness": "AUTO",
+                }
+            }
+        )
+        should_clauses.append(
+            {
+                "multi_match": {
+                    "query": variant,
+                    "fields": SEARCH_TEXT_FIELDS,
+                    "type": "phrase_prefix",
+                }
+            }
+        )
+        should_clauses.append(
+            {
+                "multi_match": {
+                    "query": variant,
+                    "fields": SEARCH_TEXT_FIELDS,
+                    "type": "cross_fields",
+                    "operator": "and",
+                    "boost": 6.0,
+                }
+            }
+        )
+
+    artist_track = _search_artist_track_parts(query)
+    if artist_track:
+        artist, track = artist_track
+        should_clauses.append(
+            {
+                "bool": {
+                    "must": [
+                        {"match_phrase": {"artist": {"query": artist, "boost": 9.0}}},
+                        {"match_phrase": {"track": {"query": track, "boost": 9.0}}},
+                    ]
+                }
+            }
+        )
+
+    return should_clauses
+
+
+def _row_search_text(row: pd.Series) -> str:
+    parts = [
+        str(row.get("title", "")),
+        str(row.get("name", "")),
+        str(row.get("item_name", "")),
+        str(row.get("business_name", "")),
+        str(row.get("track_name", "")),
+        str(row.get("artist_name", "")),
+        str(row.get("artist", "")),
+        str(row.get("track", "")),
+        str(row.get("brand", "")),
+        str(row.get("category", "")),
+        str(row.get("categories", "")),
+        str(row.get("city", "")),
+        str(row.get("state", "")),
+        str(row.get("country", "")),
+        str(row.get("description", "")),
+        str(row.get("feature_text", "")),
+        str(row.get("text_repr", "")),
+    ]
+    return " ".join(part.strip() for part in parts if str(part).strip())
+
+
+def _display_title_from_source(source: dict[str, object], item_id: str) -> str:
+    title = str(source.get("title", "")).strip()
+    if title:
+        return title
+
+    item_name = str(source.get("item_name", "")).strip()
+    if item_name:
+        return item_name
+
+    artist = str(source.get("artist", "")).strip()
+    track = str(source.get("track", "")).strip()
+    if artist and track:
+        return f"{artist} - {track}"
+    if artist:
+        return artist
+    if track:
+        return track
+
+    brand = str(source.get("brand", "")).strip()
+    category = str(source.get("category", "")).strip()
+    if brand and category:
+        return f"{brand} - {category}"
+    if brand:
+        return brand
+    if category:
+        return category
+
+    city = str(source.get("city", "")).strip()
+    state = str(source.get("state", "")).strip()
+    if city and state:
+        return f"{city} - {state}"
+    if city:
+        return city
+
+    text_repr = str(source.get("text_repr", "")).strip()
+    if text_repr:
+        return text_repr
+    return item_id
+
+
+def _display_title_from_row(row: pd.Series, item_id: str) -> str:
+    source = {
+        "title": row.get("title", ""),
+        "item_name": row.get("item_name", ""),
+        "name": row.get("name", ""),
+        "business_name": row.get("business_name", ""),
+        "track_name": row.get("track_name", ""),
+        "artist_name": row.get("artist_name", ""),
+        "brand": row.get("brand", ""),
+        "category": row.get("category", ""),
+        "city": row.get("city", ""),
+        "state": row.get("state", ""),
+        "text_repr": row.get("text_repr", ""),
+    }
+    source["artist"] = row.get("artist", row.get("artist_name", ""))
+    source["track"] = row.get("track", row.get("track_name", ""))
+    if not str(source["title"]).strip():
+        source["title"] = (
+            str(source.get("name", "")).strip()
+            or str(source.get("business_name", "")).strip()
+        )
+    return _display_title_from_source(source, item_id)
+
+
+def _display_metadata_from_source(source: dict[str, object]) -> str:
+    for key in (
+        "genres",
+        "categories",
+        "category",
+        "top_style",
+        "brand",
+        "city",
+        "state",
+        "country",
+        "temporal_profile",
+    ):
+        value = str(source.get(key, "")).strip()
+        if value:
+            return value
+    return ""
+
+
 def _tokenize_text(text: str) -> list[str]:
     return re.findall(r"[a-zA-Z0-9_]+", _normalize_text(text))
 
@@ -515,7 +869,12 @@ def _text_has_negative_genre_signal(text: str, alias: str) -> bool:
         f"not {alias}",
         f"avoid {alias}",
         f"exclude {alias}",
+        f"except {alias}",
+        f"anything but {alias}",
         f"less {alias}",
+        f"too {alias}",
+        f"too much {alias}",
+        f"too many {alias}",
     )
     return any(pattern in text for pattern in negative_patterns)
 
@@ -683,6 +1042,23 @@ def _filter_candidates_by_genres(
     return filtered
 
 
+def _apply_genre_constraints_to_indices(
+    dataset: str,
+    candidate_indices: list[int],
+    include_genres: set[str],
+    exclude_genres: set[str],
+    top_k: int,
+) -> list[int]:
+    # Exclusions stay strict; positive genre preferences remain soft so we do
+    # not collapse the list unnecessarily on sparse metadata.
+    filtered = _filter_candidates_by_genres(dataset, candidate_indices, set(), exclude_genres)
+    if include_genres:
+        include_only = _filter_candidates_by_genres(dataset, filtered, include_genres, set())
+        if len(include_only) >= top_k:
+            return include_only
+    return filtered
+
+
 def _rerank_by_prompt(dataset: str, candidate_indices: list[int], prompt: str, top_k: int) -> list[int]:
     tokens = _prompt_tokens(prompt)
     include_genres, exclude_genres = _genre_constraints_from_prompt(prompt)
@@ -726,9 +1102,9 @@ def _rerank_by_prompt(dataset: str, candidate_indices: list[int], prompt: str, t
 def _build_response(
     user_id: str, dataset: str, model: str,
     item_indices: list[int], cold_start: bool, trace_id: str | None = None,
+    latency: LatencyTelemetry | None = None,
 ) -> RecommendResponse:
     items_df = _load_items(dataset)
-    title_col = _get_col(items_df, ["title", "name", "item_name", "business_name", "track_name"])
     genre_col = _find_optional_col(items_df, ["genres_str", "category", "genres", "tags", "categories"])
 
     recs = []
@@ -738,7 +1114,7 @@ def _build_response(
         row = items_df.iloc[idx]
         genres = str(row.get(genre_col, "")).strip() if genre_col else ""
         recs.append(RecommendedItem(
-            title=str(row.get(title_col, f"Item {idx}")),
+            title=_display_title_from_row(row, str(idx)),
             score=round(1.0 - rank / len(item_indices), 3),
             genres=genres,
         ))
@@ -750,6 +1126,7 @@ def _build_response(
         cold_start=cold_start,
         items=recs,
         trace_id=trace_id,
+        latency=latency,
     )
 
 
@@ -761,6 +1138,7 @@ def _build_response_from_item_ids(
     cold_start: bool,
     trace_id: str | None = None,
     explanation: str | None = None,
+    latency: LatencyTelemetry | None = None,
 ) -> RecommendResponse:
     items_df = _load_items(dataset)
     item_id_col = _get_item_id_col(items_df)
@@ -777,7 +1155,7 @@ def _build_response_from_item_ids(
         genres = str(row.get(genre_col, "")).strip() if genre_col else ""
         recs.append(
             RecommendedItem(
-                title=str(row.get(title_col, f"Item {item_id}")),
+                title=_display_title_from_row(row, str(item_id)),
                 score=round(1.0 - rank / max(len(item_ids), 1), 3),
                 genres=genres,
             )
@@ -791,6 +1169,7 @@ def _build_response_from_item_ids(
         items=recs,
         trace_id=trace_id,
         explanation=explanation,
+        latency=latency,
     )
 
 
@@ -809,7 +1188,7 @@ def _similar_items_from_item_ids(dataset: str, item_ids: list[str], top_k: int) 
         genres = str(row.get(genre_col, "")).strip() if genre_col else ""
         items.append(
             RecommendedItem(
-                title=str(row.get(title_col, f"Item {item_id}")),
+                title=_display_title_from_row(row, str(item_id)),
                 score=round(1.0 - rank / max(top_k, 1), 3),
                 genres=genres,
             )
@@ -1014,50 +1393,10 @@ def _search_items_from_elasticsearch(req: SearchRequest) -> list[RecommendedItem
         index=es_index,
         body={
             "size": req.top_k,
-            "_source": [
-                "item_id",
-                "text_repr",
-                "title",
-                "genres",
-                "artist",
-                "track",
-                "categories",
-                "city",
-            ],
+            "_source": SEARCH_SOURCE_FIELDS,
             "query": {
                 "bool": {
-                    "should": [
-                        {"term": {"item_id": {"value": query, "boost": 12.0}}},
-                        {
-                            "multi_match": {
-                                "query": query,
-                                "fields": [
-                                    "title^6",
-                                    "text_repr^5",
-                                    "artist^4",
-                                    "track^4",
-                                    "categories^3",
-                                    "city^2",
-                                ],
-                                "type": "best_fields",
-                                "fuzziness": "AUTO",
-                            }
-                        },
-                        {
-                            "multi_match": {
-                                "query": query,
-                                "fields": [
-                                    "title^6",
-                                    "text_repr^5",
-                                    "artist^4",
-                                    "track^4",
-                                    "categories^3",
-                                    "city^2",
-                                ],
-                                "type": "phrase_prefix",
-                            }
-                        },
-                    ],
+                    "should": _build_elasticsearch_lookup_should_clauses(query),
                     "minimum_should_match": 1,
                 }
             },
@@ -1075,14 +1414,9 @@ def _search_items_from_elasticsearch(req: SearchRequest) -> list[RecommendedItem
 
         title, genres = display_map.get(item_id, ("", ""))
         if not title:
-            title = (
-                str(source.get("title", "")).strip()
-                or " - ".join(part for part in [source.get("artist"), source.get("track")] if part).strip()
-                or str(source.get("text_repr", "")).strip()
-                or item_id
-            )
+            title = _display_title_from_source(source, item_id)
         if not genres:
-            genres = str(source.get("genres") or source.get("categories") or "").strip()
+            genres = _display_metadata_from_source(source)
 
         results.append(
             RecommendedItem(
@@ -1102,7 +1436,8 @@ def _search_items_from_parquet(req: SearchRequest) -> list[RecommendedItem]:
     title_col = _get_col(items_df, ["title", "name", "item_name", "business_name", "track_name"])
     genre_col = _find_optional_col(items_df, ["genres_str", "category", "genres", "tags", "categories"])
 
-    mask = items_df[title_col].astype(str).str.contains(req.query, case=False, na=False)
+    searchable_text = items_df.apply(_row_search_text, axis=1)
+    mask = searchable_text.astype(str).str.contains(req.query, case=False, na=False, regex=False)
     matches = items_df[mask].head(req.top_k)
 
     if matches.empty:
@@ -1110,11 +1445,11 @@ def _search_items_from_parquet(req: SearchRequest) -> list[RecommendedItem]:
         if query_tokens:
             scored_rows: list[tuple[float, int]] = []
             for idx, row in items_df.iterrows():
-                title = str(row.get(title_col, ""))
-                title_tokens = set(_tokenize_text(title))
-                if not title_tokens:
+                row_text = _row_search_text(row)
+                row_tokens = set(_tokenize_text(row_text))
+                if not row_tokens:
                     continue
-                overlap = sum(1 for t in query_tokens if t in title_tokens)
+                overlap = sum(1 for t in query_tokens if t in row_tokens)
                 if overlap == 0:
                     continue
                 score = overlap / max(len(set(query_tokens)), 1)
@@ -1126,7 +1461,7 @@ def _search_items_from_parquet(req: SearchRequest) -> list[RecommendedItem]:
 
     return [
         RecommendedItem(
-            title=str(row[title_col]),
+            title=_display_title_from_row(row, str(row.get("item_id", ""))),
             score=1.0,
             genres=str(row.get(genre_col, "")).strip() if genre_col else "",
         )
@@ -1255,7 +1590,7 @@ def _rag_llm_rerank(
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("requests is required for the LLM + RAG endpoint.") from exc
 
-    llm_provider = os.getenv("RAG_LLM_PROVIDER", "ollama").strip().lower()
+    llm_provider = os.getenv("RAG_LLM_PROVIDER", "gemini").strip().lower()
     model_name = (
         os.getenv("RAG_GEMINI_MODEL", "gemini-2.5-flash-lite")
         if llm_provider == "gemini"
@@ -1377,7 +1712,7 @@ def _model_health_payload(model_slug: str, dataset: str | None = None) -> dict[s
     }
     if dataset:
         if dataset not in SUPPORTED_DATASETS:
-            raise HTTPException(400, f"Unsupported dataset: {dataset}")
+            _raise_unsupported_dataset(dataset)
         artifact_available = False
         if model_key == "matrix_factorization":
             artifact_available = (MODELS_ROOT / "matrix_factorization" / dataset / "item_factors.npy").exists()
@@ -1432,16 +1767,18 @@ def health():
 
 @app.get(f"{API_V1_PREFIX}/datasets/{{dataset}}/users", response_model=DatasetUsersResponse)
 @app.get("/dataset-users", response_model=DatasetUsersResponse)
-def dataset_users(dataset: str, limit: int = 25):
+def dataset_users(dataset: str, limit: int = 25, rec_model: str | None = None):
+    started = time.perf_counter()
     if dataset not in SUPPORTED_DATASETS:
-        raise HTTPException(400, f"Unsupported dataset: {dataset}")
+        _raise_unsupported_dataset(dataset)
 
-    options, total_available = _dataset_user_options(dataset)
+    options, total_available = _dataset_user_options_for_model(dataset, rec_model)
     trimmed = options[: max(1, min(limit, 200))]
     return DatasetUsersResponse(
         dataset=dataset,
         users=trimmed,
         total_available=total_available,
+        latency=_latency_telemetry(started),
     )
 
 
@@ -1493,9 +1830,11 @@ def recommender_model_health(model_slug: str, dataset: str | None = None):
 @app.post("/search", response_model=SearchResponse, tags=["Search"])
 def search_items(req: SearchRequest):
     """Entity lookup backed by Elasticsearch, with a local Parquet fallback for robustness."""
+    started = time.perf_counter()
     with _timed_span(req.trace_id, "recommender.search", dataset=req.dataset, top_k=req.top_k):
         if req.dataset not in SUPPORTED_DATASETS:
-            raise HTTPException(400, f"Unsupported dataset: {req.dataset}")
+            _raise_unsupported_dataset(req.dataset)
+
         search_backend = "elasticsearch"
         try:
             results = _search_items_from_elasticsearch(req)
@@ -1522,7 +1861,13 @@ def search_items(req: SearchRequest):
             len(results),
             [r.title for r in results[:5]],
         )
-        return SearchResponse(query=req.query, dataset=req.dataset, results=results, trace_id=req.trace_id)
+        return SearchResponse(
+            query=req.query,
+            dataset=req.dataset,
+            results=results,
+            trace_id=req.trace_id,
+            latency=_latency_telemetry(started),
+        )
 
 
 @app.get(f"{API_V1_PREFIX}/datasets/{{dataset}}/items/search", response_model=SearchResponse, tags=["Search"])
@@ -1585,6 +1930,7 @@ mf_router = APIRouter(prefix="/mf", tags=["Matrix Factorization"])
 @mf_router.post("", response_model=RecommendResponse, summary="MF recommendations")
 def mf_recommend(req: RecommendRequest):
     """Matrix Factorization (ALS) recommendations using cosine similarity on user/item factors."""
+    started = time.perf_counter()
     with _timed_span(
         req.trace_id,
         "recommender.mf_recommend",
@@ -1593,14 +1939,14 @@ def mf_recommend(req: RecommendRequest):
         top_k=req.top_k,
     ):
         if req.dataset not in SUPPORTED_DATASETS:
-            raise HTTPException(400, f"Unsupported dataset: {req.dataset}")
+            _raise_unsupported_dataset(req.dataset)
 
         model_dir = MODELS_ROOT / "matrix_factorization" / req.dataset
         user_factors_path = model_dir / "user_factors.npy"
         item_factors_path = model_dir / "item_factors.npy"
 
         if not item_factors_path.exists():
-            raise HTTPException(404, f"MF weights not found for dataset '{req.dataset}' at {item_factors_path}")
+            _raise_run_not_trained("matrix_factorization", req.dataset)
 
         _ = _load_npy(str(item_factors_path))
         cold_start = True
@@ -1637,14 +1983,13 @@ def mf_recommend(req: RecommendRequest):
                             scores[valid_seen] = -1e9
                     top_n = max(req.top_k * 20, 200)
                     indices = np.argsort(-scores)[:top_n].tolist()
-                    genre_filtered = _filter_candidates_by_genres(
+                    indices = _apply_genre_constraints_to_indices(
                         req.dataset,
                         indices,
                         prompt_include_genres,
                         prompt_exclude_genres,
+                        req.top_k,
                     )
-                    if len(genre_filtered) >= req.top_k:
-                        indices = genre_filtered
                     indices = _rerank_by_prompt(req.dataset, indices, req.prompt, req.top_k)
                     cold_start = False
                     explanation = (
@@ -1665,14 +2010,13 @@ def mf_recommend(req: RecommendRequest):
                         user_idx,
                     )
                     indices = _popularity_fallback(req.dataset, candidate_n)
-                    genre_filtered = _filter_candidates_by_genres(
+                    indices = _apply_genre_constraints_to_indices(
                         req.dataset,
                         indices,
                         prompt_include_genres,
                         prompt_exclude_genres,
+                        req.top_k,
                     )
-                    if len(genre_filtered) >= req.top_k:
-                        indices = genre_filtered
                     indices = _rerank_by_prompt(req.dataset, indices, req.prompt, req.top_k)
                     cold_start = True
             else:
@@ -1683,14 +2027,13 @@ def mf_recommend(req: RecommendRequest):
                     req.dataset,
                 )
                 indices = _popularity_fallback(req.dataset, candidate_n)
-                genre_filtered = _filter_candidates_by_genres(
+                indices = _apply_genre_constraints_to_indices(
                     req.dataset,
                     indices,
                     prompt_include_genres,
                     prompt_exclude_genres,
+                    req.top_k,
                 )
-                if len(genre_filtered) >= req.top_k:
-                    indices = genre_filtered
                 indices = _rerank_by_prompt(req.dataset, indices, req.prompt, req.top_k)
                 cold_start = True
                 explanation = (
@@ -1703,14 +2046,13 @@ def mf_recommend(req: RecommendRequest):
                 req.dataset,
             )
             indices = _popularity_fallback(req.dataset, candidate_n)
-            genre_filtered = _filter_candidates_by_genres(
+            indices = _apply_genre_constraints_to_indices(
                 req.dataset,
                 indices,
                 prompt_include_genres,
                 prompt_exclude_genres,
+                req.top_k,
             )
-            if len(genre_filtered) >= req.top_k:
-                indices = genre_filtered
             indices = _rerank_by_prompt(req.dataset, indices, req.prompt, req.top_k)
             explanation = (
                 "The ranking is in cold-start mode because user factors are not available for this dataset."
@@ -1723,6 +2065,7 @@ def mf_recommend(req: RecommendRequest):
             indices,
             cold_start,
             trace_id=req.trace_id,
+            latency=_latency_telemetry(started),
         )
         response.explanation = explanation
         log.info(
@@ -1749,14 +2092,15 @@ app.include_router(mf_router)
 @mf_router.post("/similar", response_model=SimilarResponse, summary="MF item similarity")
 def mf_similar(req: SimilarRequest):
     """Find items most similar to a given item using MF item factor cosine similarity."""
+    started = time.perf_counter()
     with _timed_span(req.trace_id, "recommender.mf_similar", dataset=req.dataset, top_k=req.top_k):
         if req.dataset not in SUPPORTED_DATASETS:
-            raise HTTPException(400, f"Unsupported dataset: {req.dataset}")
+            _raise_unsupported_dataset(req.dataset)
 
         model_dir = MODELS_ROOT / "matrix_factorization" / req.dataset
         item_factors_path = model_dir / "item_factors.npy"
         if not item_factors_path.exists():
-            raise HTTPException(404, f"MF weights not found for dataset '{req.dataset}'")
+            _raise_run_not_trained("matrix_factorization", req.dataset)
 
         items_df = _load_items(req.dataset)
         title_col = _get_col(items_df, ["title", "name", "item_name", "business_name", "track_name"])
@@ -1799,6 +2143,7 @@ def mf_similar(req: SimilarRequest):
             model="matrix_factorization",
             items=similar_items,
             trace_id=req.trace_id,
+            latency=_latency_telemetry(started),
         )
         _log_recommendation_preview(
             "[MF/SIMILAR]",
@@ -1812,6 +2157,7 @@ def mf_similar(req: SimilarRequest):
 # ── /two_tower — placeholder ───────────────────────────────────────────────────
 @app.post("/two_tower", response_model=RecommendResponse, tags=["Two-Tower"])
 def two_tower_recommend(req: RecommendRequest):
+    started = time.perf_counter()
     with _timed_span(
         req.trace_id,
         "recommender.two_tower_recommend",
@@ -1820,15 +2166,12 @@ def two_tower_recommend(req: RecommendRequest):
         top_k=req.top_k,
     ):
         if req.dataset not in SUPPORTED_DATASETS:
-            raise HTTPException(400, f"Unsupported dataset: {req.dataset}")
+            _raise_unsupported_dataset(req.dataset)
 
         model_dir = MODELS_ROOT / "two_tower" / req.dataset
         item_embeddings_path = model_dir / "item_embeddings.npy"
         if not item_embeddings_path.exists():
-            raise HTTPException(
-                404,
-                f"Two-Tower item embeddings not found for dataset '{req.dataset}' at {item_embeddings_path}",
-            )
+            _raise_run_not_trained("two_tower", req.dataset)
 
         item_embeddings = _load_npy(str(item_embeddings_path))
         dataset_user_id = (req.dataset_user_id or "").strip()
@@ -1857,14 +2200,13 @@ def two_tower_recommend(req: RecommendRequest):
                 )
                 if derived_user_vec is None:
                     candidate_item_ids = _popular_item_ids(req.dataset, candidate_n)
-                    genre_filtered = _filter_item_ids_by_genres(
+                    candidate_item_ids = _apply_genre_constraints_to_item_ids(
                         req.dataset,
                         candidate_item_ids,
                         prompt_include_genres,
                         prompt_exclude_genres,
+                        req.top_k,
                     )
-                    if len(genre_filtered) >= req.top_k:
-                        candidate_item_ids = genre_filtered
                     candidate_item_ids = _rerank_item_ids_by_prompt(req.dataset, candidate_item_ids, req.prompt, req.top_k)
                     explanation = (
                         "The ranking fell back to cold-start mode because the offline-trained Two-Tower "
@@ -1879,14 +2221,13 @@ def two_tower_recommend(req: RecommendRequest):
                             scores[valid_seen] = -1e9
                     top_indices = np.argsort(-scores)[:candidate_n].tolist()
                     candidate_item_ids = _indices_to_item_ids(req.dataset, top_indices)
-                    genre_filtered = _filter_item_ids_by_genres(
+                    candidate_item_ids = _apply_genre_constraints_to_item_ids(
                         req.dataset,
                         candidate_item_ids,
                         prompt_include_genres,
                         prompt_exclude_genres,
+                        req.top_k,
                     )
-                    if len(genre_filtered) >= req.top_k:
-                        candidate_item_ids = genre_filtered
                     candidate_item_ids = _rerank_item_ids_by_prompt(
                         req.dataset,
                         candidate_item_ids,
@@ -1909,14 +2250,13 @@ def two_tower_recommend(req: RecommendRequest):
                             scores[valid_seen] = -1e9
                     top_indices = np.argsort(-scores)[:candidate_n].tolist()
                     candidate_item_ids = _indices_to_item_ids(req.dataset, top_indices)
-                    genre_filtered = _filter_item_ids_by_genres(
+                    candidate_item_ids = _apply_genre_constraints_to_item_ids(
                         req.dataset,
                         candidate_item_ids,
                         prompt_include_genres,
                         prompt_exclude_genres,
+                        req.top_k,
                     )
-                    if len(genre_filtered) >= req.top_k:
-                        candidate_item_ids = genre_filtered
                     candidate_item_ids = _rerank_item_ids_by_prompt(
                         req.dataset,
                         candidate_item_ids,
@@ -1930,9 +2270,13 @@ def two_tower_recommend(req: RecommendRequest):
                     )
                 else:
                     candidate_item_ids = _popular_item_ids(req.dataset, candidate_n)
-                    genre_filtered = _filter_item_ids_by_genres(req.dataset, candidate_item_ids, prompt_genres)
-                    if len(genre_filtered) >= req.top_k:
-                        candidate_item_ids = genre_filtered
+                    candidate_item_ids = _apply_genre_constraints_to_item_ids(
+                        req.dataset,
+                        candidate_item_ids,
+                        prompt_include_genres,
+                        prompt_exclude_genres,
+                        req.top_k,
+                    )
                     candidate_item_ids = _rerank_item_ids_by_prompt(req.dataset, candidate_item_ids, req.prompt, req.top_k)
                     explanation = (
                         "The ranking is in cold-start mode because the selected dataset user was outside the "
@@ -1940,14 +2284,13 @@ def two_tower_recommend(req: RecommendRequest):
                     )
         else:
             candidate_item_ids = _popular_item_ids(req.dataset, candidate_n)
-            genre_filtered = _filter_item_ids_by_genres(
+            candidate_item_ids = _apply_genre_constraints_to_item_ids(
                 req.dataset,
                 candidate_item_ids,
                 prompt_include_genres,
                 prompt_exclude_genres,
+                req.top_k,
             )
-            if len(genre_filtered) >= req.top_k:
-                candidate_item_ids = genre_filtered
             candidate_item_ids = _rerank_item_ids_by_prompt(req.dataset, candidate_item_ids, req.prompt, req.top_k)
             explanation = (
                 "The ranking is in cold-start mode because no existing dataset user profile was selected."
@@ -1961,6 +2304,7 @@ def two_tower_recommend(req: RecommendRequest):
             cold_start,
             trace_id=req.trace_id,
             explanation=explanation,
+            latency=_latency_telemetry(started),
         )
         log.info(
             "[TWO_TOWER] trace_id=%r prompt=%r tokens=%s genre_targets=%s",
@@ -1982,17 +2326,15 @@ def two_tower_recommend(req: RecommendRequest):
 
 @app.post("/two_tower/similar", response_model=SimilarResponse, tags=["Two-Tower"])
 def two_tower_similar(req: SimilarRequest):
+    started = time.perf_counter()
     with _timed_span(req.trace_id, "recommender.two_tower_similar", dataset=req.dataset, top_k=req.top_k):
         if req.dataset not in SUPPORTED_DATASETS:
-            raise HTTPException(400, f"Unsupported dataset: {req.dataset}")
+            _raise_unsupported_dataset(req.dataset)
 
         model_dir = MODELS_ROOT / "two_tower" / req.dataset
         item_embeddings_path = model_dir / "item_embeddings.npy"
         if not item_embeddings_path.exists():
-            raise HTTPException(
-                404,
-                f"Two-Tower item embeddings not found for dataset '{req.dataset}' at {item_embeddings_path}",
-            )
+            _raise_run_not_trained("two_tower", req.dataset)
 
         items_df = _load_items(req.dataset)
         item_id_col = _get_item_id_col(items_df)
@@ -2026,6 +2368,7 @@ def two_tower_similar(req: SimilarRequest):
             model="two_tower",
             items=similar_items,
             trace_id=req.trace_id,
+            latency=_latency_telemetry(started),
         )
         _log_recommendation_preview(
             "[TWO_TOWER/SIMILAR]",
@@ -2039,6 +2382,7 @@ def two_tower_similar(req: SimilarRequest):
 
 @app.post("/two_tower_wide_deep", tags=["Two-Tower + Wide&Deep"])
 def two_tower_wide_deep_recommend(req: RecommendRequest):
+    started = time.perf_counter()
     with _timed_span(
         req.trace_id,
         "recommender.two_tower_wide_deep_recommend",
@@ -2047,16 +2391,13 @@ def two_tower_wide_deep_recommend(req: RecommendRequest):
         top_k=req.top_k,
     ):
         if req.dataset not in SUPPORTED_DATASETS:
-            raise HTTPException(400, f"Unsupported dataset: {req.dataset}")
+            _raise_unsupported_dataset(req.dataset)
 
         model_dir = MODELS_ROOT / "two_tower_wide_deep" / req.dataset
         item_embeddings_path = model_dir / "item_embeddings.npy"
         weights_path = model_dir / "weights.pt"
         if not item_embeddings_path.exists() or not weights_path.exists():
-            raise HTTPException(
-                404,
-                f"Run not trained: Two-Tower + Wide&Deep is not available for dataset '{req.dataset}'.",
-            )
+            _raise_run_not_trained("two_tower_wide_deep", req.dataset)
 
         item_embeddings = _load_npy(str(item_embeddings_path))
         dataset_user_id = (req.dataset_user_id or "").strip()
@@ -2108,14 +2449,13 @@ def two_tower_wide_deep_recommend(req: RecommendRequest):
                             exc,
                         )
                 candidate_item_ids = _indices_to_item_ids(req.dataset, top_indices)
-                genre_filtered = _filter_item_ids_by_genres(
+                candidate_item_ids = _apply_genre_constraints_to_item_ids(
                     req.dataset,
                     candidate_item_ids,
                     prompt_include_genres,
                     prompt_exclude_genres,
+                    req.top_k,
                 )
-                if len(genre_filtered) >= req.top_k:
-                    candidate_item_ids = genre_filtered
                 candidate_item_ids = _rerank_item_ids_by_prompt(req.dataset, candidate_item_ids, req.prompt, req.top_k)
                 cold_start = False
                 if exact_user_vec is not None:
@@ -2130,28 +2470,26 @@ def two_tower_wide_deep_recommend(req: RecommendRequest):
                     )
             else:
                 candidate_item_ids = _popular_item_ids(req.dataset, candidate_n)
-                genre_filtered = _filter_item_ids_by_genres(
+                candidate_item_ids = _apply_genre_constraints_to_item_ids(
                     req.dataset,
                     candidate_item_ids,
                     prompt_include_genres,
                     prompt_exclude_genres,
+                    req.top_k,
                 )
-                if len(genre_filtered) >= req.top_k:
-                    candidate_item_ids = genre_filtered
                 candidate_item_ids = _rerank_item_ids_by_prompt(req.dataset, candidate_item_ids, req.prompt, req.top_k)
                 explanation = (
                     "The ranking is in cold-start mode because no usable dataset-user profile could be built."
                 )
         else:
             candidate_item_ids = _popular_item_ids(req.dataset, candidate_n)
-            genre_filtered = _filter_item_ids_by_genres(
+            candidate_item_ids = _apply_genre_constraints_to_item_ids(
                 req.dataset,
                 candidate_item_ids,
                 prompt_include_genres,
                 prompt_exclude_genres,
+                req.top_k,
             )
-            if len(genre_filtered) >= req.top_k:
-                candidate_item_ids = genre_filtered
             candidate_item_ids = _rerank_item_ids_by_prompt(req.dataset, candidate_item_ids, req.prompt, req.top_k)
             explanation = (
                 "The ranking is in cold-start mode because no existing dataset user profile was selected."
@@ -2165,6 +2503,7 @@ def two_tower_wide_deep_recommend(req: RecommendRequest):
             cold_start,
             trace_id=req.trace_id,
             explanation=explanation,
+            latency=_latency_telemetry(started),
         )
         _log_recommendation_preview(
             "[TTWD]",
@@ -2182,10 +2521,7 @@ def two_tower_wide_deep_similar(req: SimilarRequest):
     model_dir = MODELS_ROOT / "two_tower_wide_deep" / req.dataset
     item_embeddings_path = model_dir / "item_embeddings.npy"
     if not item_embeddings_path.exists():
-        raise HTTPException(
-            404,
-            f"Run not trained: Two-Tower + Wide&Deep is not available for dataset '{req.dataset}'.",
-        )
+        _raise_run_not_trained("two_tower_wide_deep", req.dataset)
     forwarded = SimilarRequest(
         item_title=req.item_title,
         dataset=req.dataset,
@@ -2199,6 +2535,7 @@ def two_tower_wide_deep_similar(req: SimilarRequest):
 # ── /sasrec — placeholder ──────────────────────────────────────────────────────
 @app.post("/sasrec", tags=["SASRec"])
 def sasrec_recommend(req: RecommendRequest):
+    started = time.perf_counter()
     with _timed_span(
         req.trace_id,
         "recommender.sasrec_recommend",
@@ -2207,16 +2544,13 @@ def sasrec_recommend(req: RecommendRequest):
         top_k=req.top_k,
     ):
         if req.dataset not in SUPPORTED_DATASETS:
-            raise HTTPException(400, f"Unsupported dataset: {req.dataset}")
+            _raise_unsupported_dataset(req.dataset)
 
         model_dir = MODELS_ROOT / "sasrec" / req.dataset
         item_embeddings_path = model_dir / "item_embeddings.npy"
         weights_path = model_dir / "weights.pt"
         if not item_embeddings_path.exists() or not weights_path.exists():
-            raise HTTPException(
-                404,
-                f"Run not trained: SASRec is not available for dataset '{req.dataset}'.",
-            )
+            _raise_run_not_trained("sasrec", req.dataset)
 
         item_embeddings = _load_npy(str(item_embeddings_path))
         dataset_user_id = (req.dataset_user_id or "").strip()
@@ -2259,40 +2593,37 @@ def sasrec_recommend(req: RecommendRequest):
                         scores[valid_seen] = -1e9
                 top_indices = np.argsort(-scores)[:candidate_n].tolist()
                 candidate_item_ids = _indices_to_item_ids(req.dataset, top_indices)
-                genre_filtered = _filter_item_ids_by_genres(
+                candidate_item_ids = _apply_genre_constraints_to_item_ids(
                     req.dataset,
                     candidate_item_ids,
                     prompt_include_genres,
                     prompt_exclude_genres,
+                    req.top_k,
                 )
-                if len(genre_filtered) >= req.top_k:
-                    candidate_item_ids = genre_filtered
                 candidate_item_ids = _rerank_item_ids_by_prompt(req.dataset, candidate_item_ids, req.prompt, req.top_k)
                 cold_start = False
             else:
                 candidate_item_ids = _popular_item_ids(req.dataset, candidate_n)
-                genre_filtered = _filter_item_ids_by_genres(
+                candidate_item_ids = _apply_genre_constraints_to_item_ids(
                     req.dataset,
                     candidate_item_ids,
                     prompt_include_genres,
                     prompt_exclude_genres,
+                    req.top_k,
                 )
-                if len(genre_filtered) >= req.top_k:
-                    candidate_item_ids = genre_filtered
                 candidate_item_ids = _rerank_item_ids_by_prompt(req.dataset, candidate_item_ids, req.prompt, req.top_k)
                 explanation = (
                     "The ranking is in cold-start mode because no usable sequential dataset-user profile could be built."
                 )
         else:
             candidate_item_ids = _popular_item_ids(req.dataset, candidate_n)
-            genre_filtered = _filter_item_ids_by_genres(
+            candidate_item_ids = _apply_genre_constraints_to_item_ids(
                 req.dataset,
                 candidate_item_ids,
                 prompt_include_genres,
                 prompt_exclude_genres,
+                req.top_k,
             )
-            if len(genre_filtered) >= req.top_k:
-                candidate_item_ids = genre_filtered
             candidate_item_ids = _rerank_item_ids_by_prompt(req.dataset, candidate_item_ids, req.prompt, req.top_k)
             explanation = (
                 "The ranking is in cold-start mode because no existing dataset user profile was selected."
@@ -2306,6 +2637,7 @@ def sasrec_recommend(req: RecommendRequest):
             cold_start,
             trace_id=req.trace_id,
             explanation=explanation,
+            latency=_latency_telemetry(started),
         )
         _log_recommendation_preview(
             "[SASREC]",
@@ -2320,13 +2652,11 @@ def sasrec_recommend(req: RecommendRequest):
 
 @app.post("/sasrec/similar", response_model=SimilarResponse, tags=["SASRec"])
 def sasrec_similar(req: SimilarRequest):
+    started = time.perf_counter()
     model_dir = MODELS_ROOT / "sasrec" / req.dataset
     item_embeddings_path = model_dir / "item_embeddings.npy"
     if not item_embeddings_path.exists():
-        raise HTTPException(
-            404,
-            f"Run not trained: SASRec is not available for dataset '{req.dataset}'.",
-        )
+        _raise_run_not_trained("sasrec", req.dataset)
 
     items_df = _load_items(req.dataset)
     item_id_col = _get_item_id_col(items_df)
@@ -2359,11 +2689,13 @@ def sasrec_similar(req: SimilarRequest):
         model="sasrec",
         items=similar_items,
         trace_id=req.trace_id,
+        latency=_latency_telemetry(started),
     )
 
 
 @app.post("/rag", response_model=RecommendResponse, tags=["LLM + RAG"])
 def rag_recommend(req: RecommendRequest):
+    started = time.perf_counter()
     with _timed_span(
         req.trace_id,
         "recommender.rag_recommend",
@@ -2372,7 +2704,7 @@ def rag_recommend(req: RecommendRequest):
         top_k=req.top_k,
     ):
         if req.dataset not in SUPPORTED_DATASETS:
-            raise HTTPException(400, f"Unsupported dataset: {req.dataset}")
+            _raise_unsupported_dataset(req.dataset)
 
         try:
             query_text = _rag_build_query_text(req)
@@ -2426,6 +2758,7 @@ def rag_recommend(req: RecommendRequest):
                 cold_start=cold_start,
                 trace_id=req.trace_id,
                 explanation=explanation,
+                latency=_latency_telemetry(started),
             )
             _log_recommendation_preview(
                 "[RAG]",
@@ -2444,9 +2777,10 @@ def rag_recommend(req: RecommendRequest):
 
 @app.post("/rag/similar", response_model=SimilarResponse, tags=["LLM + RAG"])
 def rag_similar(req: SimilarRequest):
+    started = time.perf_counter()
     with _timed_span(req.trace_id, "recommender.rag_similar", dataset=req.dataset, top_k=req.top_k):
         if req.dataset not in SUPPORTED_DATASETS:
-            raise HTTPException(400, f"Unsupported dataset: {req.dataset}")
+            _raise_unsupported_dataset(req.dataset)
 
         items_df = _load_items(req.dataset)
         item_id_col = _get_item_id_col(items_df)
@@ -2465,7 +2799,7 @@ def rag_similar(req: SimilarRequest):
         except Exception as exc:
             raise HTTPException(
                 404,
-                f"Run not trained: LLM + RAG semantic index is not available for dataset '{req.dataset}'.",
+                _run_not_trained_detail("llm_rag", req.dataset),
             ) from exc
 
         embedding_value = source.get("embedding")
@@ -2495,4 +2829,5 @@ def rag_similar(req: SimilarRequest):
             model="llm_rag",
             items=similar_items,
             trace_id=req.trace_id,
+            latency=_latency_telemetry(started),
         )
