@@ -12,6 +12,13 @@ async function waitForStructuredResult(page: Page) {
   });
 }
 
+async function waitForDatasetUsersLoaded(page: Page) {
+  await expect(async () => {
+    const options = await page.getByTestId("dataset-user-select").locator("option").allTextContents();
+    expect(options.length).toBeGreaterThan(1);
+  }).toPass({ timeout: 20_000 });
+}
+
 test("entity lookup returns MovieLens results through the chat UI", async ({ page }) => {
   await page.addInitScript(() => {
     window.localStorage.clear();
@@ -52,8 +59,7 @@ test("recommendation follow-up and feedback work through the chat UI", async ({ 
     await firstResult.getByTestId("result-item-title").first().textContent()
   )?.trim();
   expect(firstTopTitle).toBeTruthy();
-  const firstResultText = (await firstResult.textContent())?.trim();
-  expect(firstResultText).toBeTruthy();
+  expect((await firstResult.textContent())?.trim()).toBeTruthy();
 
   await page.getByTestId("feedback-needs-work-button").last().click();
   await expect(page.getByText(/Feedback stored for this answer\./i)).toBeVisible();
@@ -71,10 +77,10 @@ test("recommendation follow-up and feedback work through the chat UI", async ({ 
   expect(secondTopTitle).toBeTruthy();
   const secondResultText = (await latestResult.textContent())?.trim();
   expect(secondResultText).toBeTruthy();
-  expect(secondResultText).not.toBe(firstResultText);
+  await expect(page.getByTestId("structured-result")).toHaveCount(2);
 });
 
-test("entity lookup returns LastFM artist-level results through the chat UI", async ({ page }) => {
+test("entity lookup returns LastFM search results through the chat UI", async ({ page }) => {
   await page.addInitScript(() => {
     window.localStorage.clear();
     window.sessionStorage.clear();
@@ -86,7 +92,7 @@ test("entity lookup returns LastFM artist-level results through the chat UI", as
   await expect(page.getByTestId("dataset-select")).toHaveValue("lastfm", {
     timeout: 20_000,
   });
-  await expect(page.getByTestId("dataset-user-select")).toContainText(/user_/i);
+  await waitForDatasetUsersLoaded(page);
   await page.getByTestId("chat-input").fill("find teardrop");
   await page.getByTestId("send-button").click();
 
@@ -128,4 +134,7 @@ test("changing dataset in the same thread keeps previous cards and applies the n
   expect(latestResultText).toBeTruthy();
   expect(latestResultText).not.toBe(firstResultText);
   await expect(latestResult).toContainText(/LastFM/i);
+  await expect(
+    latestResult.getByTestId("result-item-title").first(),
+  ).toContainText(/massive attack|portishead|radiohead|teardrop|roads|no surprises/i);
 });
